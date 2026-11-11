@@ -6,7 +6,7 @@ Contents:
          dx = rstd * (wdy - mean(wdy) - xhat * mean(wdy * xhat))
      and across rows:
          dw = sum(dy * xhat),  db = sum(dy).
-  2. Three backward paths, picked by row width:
+  2. Two backward paths, picked by row width:
        - fused: one kernel. Each program loops over a block of rows, computes dx per row,
          and keeps dw/db accumulators for the full row width in registers. Fastest while
          those fit. Measured on a T4: at N=16384 the live vectors need about 256 KB, the
@@ -15,16 +15,15 @@ Contents:
        - split: two kernels. The dx kernel handles one row per program and holds only
          x, dy and w. The dw/db kernel tiles over columns, so each program holds small
          accumulators. It reads x and dy a second time (about 1.67x the traffic of the
-         fused path) but does not spill at N=16384.
-       - tiled: the same dw/db kernel, but dx is computed in two passes over column tiles
-         so that only tile-sized vectors are live. Pass 1 accumulates the two row sums,
-         pass 2 recomputes xhat and wdy per tile and writes dx. The second pass re-reads
-         x, dy and w. Meant for widths where even the one-pass dx kernel cannot keep
-         three full-width vectors in registers.
-     No path uses atomics. dw/db partial sums go to a fixed-shape fp32 buffer and a final
-     torch.sum reduces it in a fixed order. Two launches are bitwise equal, and a row's dx
-     does not depend on the other rows in the batch. The default path depends only on N,
-     so batch invariance holds across the switch points.
+         fused path) but does not spill at N=16384. At N=32768, the top of the fp16
+         range, the dx kernel spills mildly (26 spill instructions at 8 warps) and loses
+         about 15% of its bandwidth. A two-pass tiled dx kernel with zero spills was
+         measured slower at every width, because its second pass re-reads x and dy from
+         DRAM; see RESULTS.md and git history for that experiment.
+     Neither path uses atomics. dw/db partial sums go to a fixed-shape fp32 buffer and a
+     final torch.sum reduces it in a fixed order. Two launches are bitwise equal, and a
+     row's dx does not depend on the other rows in the batch. The default path depends
+     only on N, so batch invariance holds across the switch point.
   3. Launchers and a torch.autograd.Function so the kernels plug into a model.
 
 Correctness checks, mutation tests and the benchmark live in layernorm_bwd_checks.py.
@@ -43,27 +42,23 @@ import triton.language as tl
 
 from layernorm_triton import EPS, layer_norm_triton_fwd, num_warps_for, validate_inputs
 
-PATHS = ("fused", "split", "tiled")
+PATHS = ("fused", "split")
 
 # Fused path: target program count. Rows per program is derived from M, so the partial-sum
 # buffer stays near FUSED_TARGET_PROGRAMS x N regardless of batch size.
 FUSED_TARGET_PROGRAMS = 256
 
-# Switch points by block size (next power of two at or above N). On a T4 the fused kernel
-# runs cleanly at 8192 and spills at 16384 (RESULTS.md). TILED_MIN_BLOCK is provisional:
-# the one-pass dx kernel needs 32 elements per thread at 32768, which exceeds the 64
-# registers a 32-warp program gets, but that has not been measured yet. Re-measure with
-# probe_spills.py and the benchmark on other GPUs.
+# Switch point by block size (next power of two at or above N). On a T4 the fused kernel
+# runs cleanly at 8192 and spills at 16384 (RESULTS.md). Re-measure with probe_spills.py
+# and the benchmark on other GPUs.
 SPLIT_MIN_BLOCK = 16384
-TILED_MIN_BLOCK = 32768
 
-# dx kernels: at most this many elements per thread per vector, so x, dy and w stay in
-# registers. 16 elements x 3 vectors fits the 64-register cap that applies at 32 warps.
+# dx kernel warps: about DX_ELEMENTS_PER_THREAD elements per thread per vector, capped at
+# MAX_WARPS. The cap is from measurement on a T4 (RESULTS.md): at N=32768, 8 warps ran 14%
+# faster than 32 even though both spill, because 4x fewer threads means about half the
+# total spill traffic; at N=16384 the two tied.
 DX_ELEMENTS_PER_THREAD = 16
-MAX_WARPS = 32
-
-# Tiled dx kernel: column tile width. Pass 1 holds about seven tile-sized fp32 vectors.
-DX_TILE_N = 4096
+MAX_WARPS = 8
 
 # dw/db kernel: column tile width, target number of row groups, and warps per program.
 # 1024 columns over 4 warps is 8 elements per thread per vector.
@@ -81,8 +76,7 @@ DWDB_NUM_WARPS = 4
 def _row_dx(x, dy, w, mean, rstd, mask, N):
     """dx for one row in fp32. Also returns xhat, which the fused kernel needs for dw.
 
-    Shared by the fused and split paths so they run the same formula. The tiled kernel
-    runs the same arithmetic split across two passes.
+    Shared by the fused and split paths so they run the same formula.
     """
     # Masked lanes are zero in x, so xhat there would be -mean * rstd. Zero them so
     # they contribute nothing to the two row means.
@@ -172,61 +166,6 @@ def _layer_norm_bwd_dx_kernel(
 
 
 @triton.jit
-def _layer_norm_bwd_dx_tiled_kernel(
-    dy_ptr,
-    x_ptr,
-    w_ptr,
-    mean_ptr,
-    rstd_ptr,
-    dx_ptr,
-    dy_row_stride,
-    x_row_stride,
-    dx_row_stride,
-    N,
-    BLOCK_N: tl.constexpr,
-):
-    # One row per program, two passes over column tiles. Only tile-sized vectors are live,
-    # so register use does not grow with N. Pass 2 re-reads x, dy and w; whether that hits
-    # L2 depends on how many rows are in flight at once.
-    row = tl.program_id(0).to(tl.int64)
-    mean = tl.load(mean_ptr + row)
-    rstd = tl.load(rstd_ptr + row)
-    x_row = x_ptr + row * x_row_stride
-    dy_row = dy_ptr + row * dy_row_stride
-    dx_row = dx_ptr + row * dx_row_stride
-
-    # Pass 1: elementwise partial sums per tile, reduced once at the end. Same any-order
-    # sum the error bound already assumes.
-    acc1 = tl.zeros([BLOCK_N], dtype=tl.float32)
-    acc2 = tl.zeros([BLOCK_N], dtype=tl.float32)
-    for start in range(0, N, BLOCK_N):
-        cols = start + tl.arange(0, BLOCK_N)
-        mask = cols < N
-        x = tl.load(x_row + cols, mask=mask, other=0.0).to(tl.float32)
-        dy = tl.load(dy_row + cols, mask=mask, other=0.0).to(tl.float32)
-        w = tl.load(w_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-        xhat = tl.where(mask, (x - mean) * rstd, 0.0)
-        wdy = tl.where(mask, w * dy, 0.0)
-        acc1 += xhat * wdy
-        acc2 += wdy
-    c1 = tl.sum(acc1, axis=0) / N
-    c2 = tl.sum(acc2, axis=0) / N
-
-    # Pass 2: recompute xhat and wdy per tile (bitwise the same values as pass 1) and
-    # write dx. Masked lanes are not stored, so they need no zeroing here.
-    for start in range(0, N, BLOCK_N):
-        cols = start + tl.arange(0, BLOCK_N)
-        mask = cols < N
-        x = tl.load(x_row + cols, mask=mask, other=0.0).to(tl.float32)
-        dy = tl.load(dy_row + cols, mask=mask, other=0.0).to(tl.float32)
-        w = tl.load(w_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-        xhat = (x - mean) * rstd
-        wdy = w * dy
-        dx = (wdy - (xhat * c1 + c2)) * rstd
-        tl.store(dx_row + cols, dx.to(dx_ptr.dtype.element_ty), mask=mask)
-
-
-@triton.jit
 def _layer_norm_bwd_dwdb_kernel(
     dy_ptr,
     x_ptr,
@@ -273,18 +212,13 @@ def _layer_norm_bwd_dwdb_kernel(
 
 def default_path(n: int) -> str:
     """Return the backward path used for row width n when none is forced."""
-    block = triton.next_power_of_2(n)
-    if block >= TILED_MIN_BLOCK:
-        return "tiled"
-    if block >= SPLIT_MIN_BLOCK:
-        return "split"
-    return "fused"
+    return "split" if triton.next_power_of_2(n) >= SPLIT_MIN_BLOCK else "fused"
 
 
 def dx_num_warps(block: int) -> int:
-    """Warps for a dx kernel of the given block or tile width.
+    """Warps for the dx kernel at the given block size.
 
-    Enough that each thread holds at most DX_ELEMENTS_PER_THREAD elements per vector.
+    About DX_ELEMENTS_PER_THREAD elements per thread per vector, between 1 and MAX_WARPS.
     """
     return min(max(block // (32 * DX_ELEMENTS_PER_THREAD), 1), MAX_WARPS)
 
@@ -411,36 +345,7 @@ def _bwd_split(
     return dx, *_dwdb(dy_rows, x_rows, mean, rstd, block_size)
 
 
-def _bwd_tiled(
-    dy_rows: torch.Tensor,
-    x_rows: torch.Tensor,
-    weight: torch.Tensor,
-    mean: torch.Tensor,
-    rstd: torch.Tensor,
-    block_size: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Tiled path: two-pass dx kernel plus the dw/db kernel."""
-    m, n = x_rows.shape
-    dx = torch.empty_like(x_rows)
-    tile = min(DX_TILE_N, block_size)
-    _layer_norm_bwd_dx_tiled_kernel[(m,)](
-        dy_rows,
-        x_rows,
-        weight,
-        mean,
-        rstd,
-        dx,
-        dy_rows.stride(0),
-        x_rows.stride(0),
-        dx.stride(0),
-        n,
-        BLOCK_N=tile,
-        num_warps=dx_num_warps(tile),
-    )
-    return dx, *_dwdb(dy_rows, x_rows, mean, rstd, block_size)
-
-
-_IMPL = {"fused": _bwd_fused, "split": _bwd_split, "tiled": _bwd_tiled}
+_IMPL = {"fused": _bwd_fused, "split": _bwd_split}
 
 
 def layer_norm_triton_bwd(

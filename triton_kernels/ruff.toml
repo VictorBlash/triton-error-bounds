@@ -1,0 +1,12 @@
+line-length = 120
+
+[lint]
+select = ["E", "F", "W", "I", "B", "RUF", "EXE"]
+# B023: the benchmark lambdas are called by do_bench inside the same loop iteration, so
+# the loop variables they close over are never stale. RUF010: str() in f-strings is fine.
+ignore = ["B023", "RUF010"]
+
+[lint.isort]
+# The kernel modules import each other by bare name; keep them in the first-party group
+# no matter which directory ruff runs from.
+known-first-party = ["layernorm_triton", "layernorm_triton_bwd", "layernorm_bwd_checks", "probe_spills"]

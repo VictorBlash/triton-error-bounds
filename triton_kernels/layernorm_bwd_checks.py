@@ -186,23 +186,23 @@ def _check_path(
     """
     _, mean, rstd = layer_norm_triton_fwd(x, weight, bias, eps)
     got = layer_norm_triton_bwd(dy, x, weight, mean, rstd, path=path)
-    for name, t in zip(("dx", "dw", "db"), got):
+    for name, t in zip(("dx", "dw", "db"), got, strict=True):
         assert torch.isfinite(t).all(), f"{path} {name} has non-finite values"
 
     # Fixed tolerance against eager autograd. dw and db are sums over M rows, so their
     # magnitude grows with M: rtol does the work, atol scales with M for values near zero.
     atol, rtol = _parity_tolerances(x.dtype)
     m = x.reshape(-1, x.shape[-1]).shape[0]
-    for name, g, r, a in zip(("dx", "dw", "db"), got, want_eager, (atol, atol * m, atol * m)):
+    for name, g, r, a in zip(("dx", "dw", "db"), got, want_eager, (atol, atol * m, atol * m), strict=True):
         _assert_close(f"{path} {name} vs eager", g, r, a, rtol)
 
     # Per-element bound against fp64. Tighter than allclose where gradients are small,
     # and catches a kernel that matches eager only because both share a bug.
-    for name, g, r, b in zip(("dx", "dw", "db"), got, *want_fp64):
+    for name, g, r, b in zip(("dx", "dw", "db"), got, *want_fp64, strict=True):
         _assert_within_bound(f"{path} {name} vs fp64", g, r, b)
 
     again = layer_norm_triton_bwd(dy, x, weight, mean, rstd, path=path)
-    assert all(torch.equal(a, b) for a, b in zip(got, again)), f"{path}: two launches differ"
+    assert all(torch.equal(a, b) for a, b in zip(got, again, strict=True)), f"{path}: two launches differ"
 
     # Batch invariance of dx. dw and db are batch reductions by definition, so only dx
     # must match when a row is launched alone.
@@ -233,7 +233,7 @@ def check_backward(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, ep
     wg = weight.detach().requires_grad_(True)
     bg = bias.detach().requires_grad_(True)
     layer_norm_autograd(xg, wg, bg, eps).backward(dy)
-    assert all(torch.equal(a, b) for a, b in zip((xg.grad, wg.grad, bg.grad), default)), (
+    assert all(torch.equal(a, b) for a, b in zip((xg.grad, wg.grad, bg.grad), default, strict=True)), (
         "autograd wrapper gradients differ from the default path"
     )
 
@@ -287,7 +287,7 @@ def check_bound_rejects_mutants(device: str) -> dict[str, bool]:
 
     for path in PATHS:
         got = layer_norm_triton_bwd(dy, x, w, mean, rstd, path=path)
-        for name, gt, r, bd in zip(("dx", "dw", "db"), got, refs, bounds):
+        for name, gt, r, bd in zip(("dx", "dw", "db"), got, refs, bounds, strict=True):
             _assert_within_bound(f"{path} {name} with small dy", gt, r, bd)
 
     dx_bad = torch.empty_like(x)
@@ -317,9 +317,8 @@ def benchmark(device: str, dtype: torch.dtype = torch.float16, m: int = 4096) ->
     """Print median backward time for every path and eager PyTorch.
 
     GB/s uses the same byte count for all columns: one read each of x and dy and one write
-    of dx, the traffic any backward must move. Extra reads in the split and tiled paths
-    show up as lower GB/s rather than as a different formula, so the columns compare
-    directly.
+    of dx, the traffic any backward must move. The split path's extra reads show up as
+    lower GB/s rather than as a different formula, so the columns compare directly.
     """
     print(f"\nbackward benchmark: M={m}, dtype={dtype}, median ms and GB/s")
     header = "  ".join(f"{p + ' ms':>9} {'GB/s':>6}" for p in (*PATHS, "eager"))

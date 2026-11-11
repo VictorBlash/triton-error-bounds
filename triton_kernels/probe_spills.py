@@ -6,8 +6,7 @@ is available. Prints registers per thread, spill count, median time and bandwidt
 kernel that spills shows up here before it shows up as a bandwidth cliff in the benchmark.
 The N=16384 fused-backward cliff in RESULTS.md was found this way.
 
-Sweeps: the one-pass dx kernel over warp counts, the tiled dx kernel over tile widths.
-Eager forward and backward are timed for reference.
+Sweeps the dx kernel over warp counts. Eager forward and backward are timed for reference.
 
 GB/s counts the minimum traffic of each kernel: forward x in, y out, w and b in; dx
 kernels x, dy in, dx out; dw/db x, dy in; fused x, dy in, dx out.
@@ -37,17 +36,14 @@ from layernorm_triton_bwd import (
     DWDB_BLOCK_N,
     DWDB_NUM_WARPS,
     DWDB_ROW_GROUPS,
-    DX_TILE_N,
     FUSED_TARGET_PROGRAMS,
     _layer_norm_bwd_dwdb_kernel,
     _layer_norm_bwd_dx_kernel,
-    _layer_norm_bwd_dx_tiled_kernel,
     _layer_norm_bwd_fused_kernel,
     dx_num_warps,
 )
 
-DX_WARP_SWEEP = (8, 16, 32)
-DX_TILE_SWEEP = (2048, 4096, 8192)
+DX_WARP_SWEEP = (4, 8, 16, 32)
 
 
 def _report(name: str, launch: Callable[[], object], nbytes: int) -> None:
@@ -103,21 +99,9 @@ def probe(n: int, m: int, dtype: torch.dtype, device: str) -> None:
             continue
         tag = " (launcher)" if warps == launcher_warps else ""
         _report(
-            f"dx one-pass warps={warps}{tag}",
+            f"dx warps={warps}{tag}",
             lambda warps=warps: _layer_norm_bwd_dx_kernel[(m,)](
                 dy, x, w, mean, rstd, dx, dy.stride(0), x.stride(0), dx.stride(0), n, BLOCK_SIZE=block, num_warps=warps
-            ),
-            3 * m * n * esize,
-        )
-
-    launcher_tile = min(DX_TILE_N, block)
-    for tile in sorted({launcher_tile, *(t for t in DX_TILE_SWEEP if t <= block)}):
-        tag = " (launcher)" if tile == launcher_tile else ""
-        _report(
-            f"dx tiled tile={tile} warps={dx_num_warps(tile)}{tag}",
-            lambda tile=tile: _layer_norm_bwd_dx_tiled_kernel[(m,)](
-                dy, x, w, mean, rstd, dx, dy.stride(0), x.stride(0), dx.stride(0), n,
-                BLOCK_N=tile, num_warps=dx_num_warps(tile),
             ),
             3 * m * n * esize,
         )
@@ -130,7 +114,8 @@ def probe(n: int, m: int, dtype: torch.dtype, device: str) -> None:
     _report(
         f"dw/db tile={block_n} warps={DWDB_NUM_WARPS}",
         lambda: _layer_norm_bwd_dwdb_kernel[(groups, triton.cdiv(n, block_n))](
-            dy, x, mean, rstd, gdw, gdb, dy.stride(0), x.stride(0), m, n, rpp_g, BLOCK_N=block_n, num_warps=DWDB_NUM_WARPS
+            dy, x, mean, rstd, gdw, gdb, dy.stride(0), x.stride(0), m, n, rpp_g,
+            BLOCK_N=block_n, num_warps=DWDB_NUM_WARPS,
         ),
         2 * m * n * esize,
     )

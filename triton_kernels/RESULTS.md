@@ -41,25 +41,27 @@ GB/s counts one read of x, one write of y, and one read each of weight and bias.
 
 At N = 32768, the top of the fp16 single-block range, the forward kernel uses 233 of 255 registers with no spills and drops to 221 GB/s.
 
-## Backward (run 3)
+## Backward (run 4, current code)
 
-| N | Fused ms | GB/s | Split ms | GB/s | Tiled ms | GB/s | Eager ms | GB/s | Default (run 3) | Speedup, default vs eager |
-|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---|---:|
-| 512 | 0.1096 | 114.8 | 0.1357 | 92.7 | 0.1243 | 101.2 | 0.1046 | 120.3 | fused | 0.95x |
-| 1024 | 0.1422 | 177.0 | 0.2064 | 121.9 | 0.2211 | 113.8 | 0.1881 | 133.8 | fused | 1.32x |
-| 2048 | 0.2736 | 183.9 | 0.3706 | 135.8 | 0.4026 | 125.0 | 0.4154 | 121.2 | fused | 1.52x |
-| 4096 | 0.5196 | 193.7 | 0.7066 | 142.5 | 0.7873 | 127.9 | 0.9786 | 102.9 | fused | 1.88x |
-| 8192 | 1.0009 | 201.1 | 1.3763 | 146.3 | 1.8376 | 109.6 | 1.9753 | 101.9 | fused | 1.97x |
-| 16384 | 13.1564 | 30.6 | 2.7043 | 148.9 | 3.7281 | 108.0 | 4.2496 | 94.8 | split | 1.57x |
-| 32768 | 50.2999 | 16.0 | 6.6595 | 120.9 | 7.4710 | 107.8 | 8.8857 | 90.6 | tiled | 1.19x |
+Run 4 is after the dx kernel's warp cap was lowered from 32 to 8 and the tiled path was removed. See "The tiled experiment" for why.
 
-GB/s counts only the traffic any backward must move: one read each of x and dy and one write of dx. The split and tiled paths read more than that, so their real bandwidth is higher than the column shows.
+| N | Fused ms | GB/s | Split ms | GB/s | Eager ms | GB/s | Default | Speedup, default vs eager |
+|---:|---:|---:|---:|---:|---:|---:|:---|---:|
+| 512 | 0.1106 | 113.8 | 0.1359 | 92.6 | 0.1200 | 104.9 | fused | 1.08x |
+| 1024 | 0.1414 | 177.9 | 0.2066 | 121.8 | 0.1881 | 133.8 | fused | 1.33x |
+| 2048 | 0.2743 | 183.5 | 0.3714 | 135.5 | 0.4140 | 121.6 | fused | 1.51x |
+| 4096 | 0.5196 | 193.7 | 0.7069 | 142.4 | 0.9784 | 102.9 | fused | 1.88x |
+| 8192 | 1.0008 | 201.2 | 1.3768 | 146.2 | 1.9761 | 101.9 | fused | 1.97x |
+| 16384 | 13.1703 | 30.6 | 2.6904 | 149.7 | 4.2494 | 94.8 | split | 1.58x |
+| 32768 | 50.2820 | 16.0 | 6.0267 | 133.6 | 8.8866 | 90.6 | split | 1.47x |
 
-At N = 512 the fused path and eager trade places between runs (1.10x in run 2, 0.95x here); call it even.
+GB/s counts only the traffic any backward must move: one read each of x and dy and one write of dx. The split path reads more than that, so its real bandwidth is higher than the column shows.
+
+At N = 512 the fused path and eager trade places between runs (1.10x, 0.95x, 1.08x across runs 2 to 4); call it even.
 
 The fused path beats the split path at every N up to 8192, by 1.3 to 1.4 times, so the switch at N = 16384 (`SPLIT_MIN_BLOCK`) stays.
 
-The tiled path is slower than split at every width, including N = 32768 where it was the default in run 3. See "The tiled experiment" below. The default at 32768 is being changed to split.
+The warp cap changed only the N = 32768 row: split went from 6.66 ms in run 3 to 6.03 ms, matching the 6.0 ms projected from the probe. All other rows are within noise of run 3.
 
 ### The N = 16384 cliff
 
@@ -76,7 +78,21 @@ Every setting spills. A T4 SM has 256 KB of registers. At N = 16384 each fp32 ro
 
 ### The tiled experiment (N = 32768)
 
-Prediction before measuring: the one-pass dx kernel would spill at N = 32768, because at 32 warps each thread holds 32 elements per vector and three vectors exceed the 64-register cap. Proposed fix: a two-pass dx kernel over 4096-column tiles, so only tile-sized vectors stay live.
+Prediction before measuring: the one-pass dx kernel would spill at N = 32768, because at 32 warps each thread holds 32 elements per vector and three vectors exceed the 64-register cap. Proposed fix: a two-pass dx kernel over 4096-column tiles, so only tile-sized vectors stay live. That kernel was committed as the `tiled` path in `d3321b0` and removed in the next commit.
+
+Run 3 benchmark, with the tiled path as a third column:
+
+| N | Fused ms | Split ms | Tiled ms | Eager ms | Default in run 3 |
+|---:|---:|---:|---:|---:|:---|
+| 512 | 0.1096 | 0.1357 | 0.1243 | 0.1046 | fused |
+| 1024 | 0.1422 | 0.2064 | 0.2211 | 0.1881 | fused |
+| 2048 | 0.2736 | 0.3706 | 0.4026 | 0.4154 | fused |
+| 4096 | 0.5196 | 0.7066 | 0.7873 | 0.9786 | fused |
+| 8192 | 1.0009 | 1.3763 | 1.8376 | 1.9753 | fused |
+| 16384 | 13.1564 | 2.7043 | 3.7281 | 4.2496 | split |
+| 32768 | 50.2999 | 6.6595 | 7.4710 | 8.8857 | tiled |
+
+Tiled lost to split at every width, including N = 32768 where it was the default. In run 3 the split path still used 32 warps for dx.
 
 `probe_spills.py` output, M = 4096, fp16:
 
@@ -116,7 +132,7 @@ What the numbers say:
 2. The tiled kernel has zero spills and is slower at every tile width and at both N. Counting its real traffic (x and dy read twice, dx written once), it moves 1.34 GB in 5.34 ms at N = 32768, which is 251 GB/s: it is at the bandwidth ceiling. It is slow because it moves 5/3 the bytes, and the second pass does not hit L2. With one program per SM and 40 SMs, the rows in flight total about 5 MB of x and dy against a 4 MB L2.
 3. The warp sweep found a better setting than the launcher's: 8 warps runs 3.89 ms at 32768, 14% faster than 32 warps, and ties at 16384. 8 warps shows more spill instructions per thread (26 against 12) but runs 4 times fewer threads, so the total spill traffic is about half. Fewer threads also means a cheaper cross-warp reduction, though that part is not measured separately.
 
-Decision: drop the tiled path and cap the dx kernel at 8 warps. With that cap the split path at N = 32768 should take about 6.0 ms (3.89 + 2.07 plus the final sums), about 1.48x eager. That number is a projection until the benchmark is rerun.
+Decision: drop the tiled path and cap the dx kernel at 8 warps. Projected split time at N = 32768: about 6.0 ms (3.89 + 2.07 plus the final sums). Run 4 measured 6.03 ms.
 
 ### Retracted numbers
 
@@ -124,5 +140,5 @@ The first backward benchmark reported Triton as 2 to 2.8 times faster than eager
 
 ## Open items
 
-- Rerun `layernorm_bwd_checks.py` after the 8-warp cap to confirm the checks and the projected 6.0 ms at N = 32768.
-- At N = 32768 the one-pass dx kernel keeps 26 spill instructions at 8 warps. Accepted: it costs about 15% against the 16384 bandwidth, and the measured alternative was slower.
+- At N = 32768 the dx kernel keeps 26 spill instructions at 8 warps and runs at 207 GB/s against 247 GB/s at N = 16384. Accepted: the measured alternative was slower, and 32768 is the top of the fp16 single-block range.
+- All numbers are from one GPU model. The switch point and the warp cap are T4 measurements; rerun `probe_spills.py` and both benchmarks before trusting them on another GPU.
