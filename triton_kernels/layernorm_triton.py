@@ -456,7 +456,7 @@ def benchmark(device: str, dtype: torch.dtype = torch.float16, m: int = 4096) ->
     """
     print(f"\nbenchmark: M={m}, dtype={dtype}, median ms [p20, p80], GB/s")
     print(f"{'N':>6}  {'triton ms':>22}  {'GB/s':>7}  {'eager ms':>22}  {'GB/s':>7}")
-    for n in (512, 1024, 2048, 4096, 8192, 16384):
+    for n in (512, 1024, 2048, 4096, 8192, 16384, 32768):
         x, w, b = make_inputs((m, n), dtype, device)
         bytes_moved = (2 * m * n + 2 * n) * x.element_size()
         cells = []
