@@ -16,9 +16,9 @@ mean_err, store_err, row_stats_with_error) and the same assumptions: no fp32 ove
 underflow, approximate sqrt and division within APPROX_MATH_ULPS and DIV_ULPS. The sum
 bounds assume no order, so one bound covers every path.
 
-Benchmark: every path vs eager across widths, to locate the switch points.
+Benchmark: every path vs eager PyTorch vs torch.compile across widths.
 
-Usage: python layernorm_bwd_checks.py [--skip-bench]
+Usage: python layernorm_bwd_checks.py [--skip-bench] [--no-compile]
 """
 
 from __future__ import annotations
@@ -32,6 +32,7 @@ import triton
 import triton.language as tl
 
 from layernorm_triton import (
+    BENCH_WIDTHS,
     CASES,
     EPS,
     U_FP32,
@@ -39,6 +40,7 @@ from layernorm_triton import (
     _gamma,
     _parity_tolerances,
     add_err,
+    compiled_layer_norm,
     layer_norm_eager,
     layer_norm_triton_fwd,
     make_inputs,
@@ -50,7 +52,6 @@ from layernorm_triton import (
 from layernorm_triton_bwd import PATHS, default_path, layer_norm_autograd, layer_norm_triton_bwd
 
 Grads = tuple[torch.Tensor, torch.Tensor, torch.Tensor]
-BENCH_WIDTHS = (512, 1024, 2048, 4096, 8192, 16384, 32768)
 
 
 # ---------------------------------------------------------------------------
@@ -313,15 +314,37 @@ def check_bound_rejects_mutants(device: str) -> dict[str, bool]:
 # ---------------------------------------------------------------------------
 
 
-def benchmark(device: str, dtype: torch.dtype = torch.float16, m: int = 4096) -> None:
-    """Print median backward time for every path and eager PyTorch.
+def _backward_runner(
+    forward: Callable[..., torch.Tensor], x: torch.Tensor, w: torch.Tensor, b: torch.Tensor, dy: torch.Tensor
+) -> Callable[[], None]:
+    """Build a zero-arg function that runs one backward pass through `forward`'s graph.
+
+    The forward runs once here; each call then replays only the backward. Grads are
+    cleared before each call: accumulating into an existing .grad adds a read and a write
+    of dx and would overstate the baseline's time.
+    """
+    xg = x.detach().requires_grad_(True)
+    wg = w.detach().requires_grad_(True)
+    bg = b.detach().requires_grad_(True)
+    y = forward(xg, wg, bg)
+
+    def run() -> None:
+        xg.grad = wg.grad = bg.grad = None
+        y.backward(dy, retain_graph=True)
+
+    return run
+
+
+def benchmark(device: str, dtype: torch.dtype = torch.float16, m: int = 4096, compile_baseline: bool = True) -> None:
+    """Print median backward time for every path, eager PyTorch and torch.compile.
 
     GB/s uses the same byte count for all columns: one read each of x and dy and one write
     of dx, the traffic any backward must move. The split path's extra reads show up as
     lower GB/s rather than as a different formula, so the columns compare directly.
     """
+    names = [*PATHS, "eager"] + (["compile"] if compile_baseline else [])
     print(f"\nbackward benchmark: M={m}, dtype={dtype}, median ms and GB/s")
-    header = "  ".join(f"{p + ' ms':>9} {'GB/s':>6}" for p in (*PATHS, "eager"))
+    header = "  ".join(f"{nm + ' ms':>10} {'GB/s':>6}" for nm in names)
     print(f"{'N':>6}  {header}  default")
     for n in BENCH_WIDTHS:
         x, w, b = make_inputs((m, n), dtype, device)
@@ -329,31 +352,23 @@ def benchmark(device: str, dtype: torch.dtype = torch.float16, m: int = 4096) ->
         _, mean, rstd = layer_norm_triton_fwd(x, w, b)
         bytes_moved = 3 * m * n * x.element_size()
 
-        xg = x.detach().requires_grad_(True)
-        wg = w.detach().requires_grad_(True)
-        bg = b.detach().requires_grad_(True)
-        y_eager = layer_norm_eager(xg, wg, bg)
-
-        def run_eager() -> None:
-            # Clear grads so each call writes fresh ones. Accumulating into an existing
-            # .grad adds a read and a write of dx and would overstate eager's time.
-            xg.grad = wg.grad = bg.grad = None
-            y_eager.backward(dy, retain_graph=True)
-
         runs: list[Callable[[], object]] = [
             (lambda p=p: layer_norm_triton_bwd(dy, x, w, mean, rstd, path=p)) for p in PATHS
         ]
-        runs.append(run_eager)
+        runs.append(_backward_runner(layer_norm_eager, x, w, b, dy))
+        if compile_baseline:
+            runs.append(_backward_runner(compiled_layer_norm(), x, w, b, dy))
         cells = []
         for fn in runs:
             ms = triton.testing.do_bench(fn)
-            cells.append(f"{ms:9.4f} {bytes_moved / (ms * 1e-3) / 1e9:6.1f}")
+            cells.append(f"{ms:10.4f} {bytes_moved / (ms * 1e-3) / 1e9:6.1f}")
         print(f"{n:>6}  {'  '.join(cells)}  {default_path(n)}")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Triton LayerNorm backward: correctness checks and benchmark")
     parser.add_argument("--skip-bench", action="store_true", help="run correctness checks only")
+    parser.add_argument("--no-compile", action="store_true", help="leave the torch.compile column out of the benchmark")
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -372,7 +387,7 @@ def main() -> int:
         )
 
     if not args.skip_bench:
-        benchmark(device)
+        benchmark(device, compile_baseline=not args.no_compile)
     return 0
 
 

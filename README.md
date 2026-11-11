@@ -2,14 +2,14 @@
 
 Fused LayerNorm forward and backward in [Triton](https://github.com/triton-lang/triton), with a correctness check that is stricter than `torch.allclose` and every performance claim measured and recorded.
 
-Measured on a Tesla T4 (Google Colab), M = 4096 rows, fp16:
+Measured on a Tesla T4 (Google Colab), M = 4096 rows, fp16, against eager `F.layer_norm` and `torch.compile`:
 
-| | Speedup vs eager PyTorch | Bandwidth |
-|:---|:---|:---|
-| Forward | 1.0x at N = 1024–2048, 1.3–1.45x at N ≥ 4096 | about 230 GB/s, 72% of the T4's 320 GB/s peak |
-| Backward | 1.3–2.0x from N = 1024 to 32768 | up to 200 GB/s |
+| | vs eager PyTorch | vs torch.compile | Bandwidth |
+|:---|:---|:---|:---|
+| Forward | 1.3–1.45x at N ≥ 4096 | a wash: 0.93–1.05x up to N = 8192, 1.1–1.3x at 16384–32768 | about 230 GB/s, 72% of the T4's 320 GB/s peak |
+| Backward | 1.3–2.0x from N = 1024 | 1.35–1.8x at N = 1024 and N ≥ 4096; tie at 512, 0.96x at 2048 | up to 200 GB/s |
 
-Full tables, the register-spill investigation, a retracted measurement and the reasons behind every tuning constant are in [RESULTS.md](RESULTS.md).
+The eager comparison flatters the forward: inductor's generated forward kernel matches or beats this one at common hidden sizes. The backward is where the custom kernel earns its place. Full tables, the register-spill investigation, a retracted measurement and the reasons behind every tuning constant are in [RESULTS.md](RESULTS.md).
 
 ## What is different here
 

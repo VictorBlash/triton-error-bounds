@@ -5,7 +5,7 @@ Measured on Google Colab, November 2026:
 - GPU: NVIDIA Tesla T4, 16 GB, about 320 GB/s peak memory bandwidth. The best any kernel here reaches is about 250 GB/s, and that is treated as the practical ceiling.
 - torch 2.14.1+cu130, triton 3.8.0.
 
-All timings use M = 4096 rows, fp16, and the median from `triton.testing.do_bench`. Tables marked "run 3" are from the run that added N = 32768 and the tiled path; they supersede the earlier runs, whose numbers agreed within noise at every width they shared.
+All timings use M = 4096 rows, fp16, and the median from `triton.testing.do_bench`. Runs are numbered in the order they happened. The current tables are from run 5, which added the `torch.compile` column (default inductor mode, `dynamic=False`, one compile per width). Earlier runs agreed within noise at every width they shared, except eager at N ≤ 1024, which swings by up to 2x between runs.
 
 ## Correctness
 
@@ -25,43 +25,49 @@ At gradients near 1e-3, a fixed `atol` of 1e-3 is as large as the values it chec
 
 The bound runs use the corrected error model: an earlier version counted the 4-ulp sqrt and division allowance as 4 × 2^-24, which is 2 ulps.
 
-## Forward (run 3)
+## Forward (run 5, current code)
 
-| N | Triton ms | Triton GB/s | Eager ms | Eager GB/s | Speedup |
-|---:|---:|---:|---:|---:|---:|
-| 512 | 0.0415 | 202.2 | 0.0588 | 142.7 | 1.42x |
-| 1024 | 0.0758 | 221.5 | 0.0764 | 219.7 | 1.01x |
-| 2048 | 0.1454 | 230.8 | 0.1484 | 226.2 | 1.02x |
-| 4096 | 0.2938 | 228.5 | 0.3834 | 175.1 | 1.30x |
-| 8192 | 0.5882 | 228.2 | 0.8218 | 163.4 | 1.40x |
-| 16384 | 1.1479 | 233.9 | 1.6653 | 161.2 | 1.45x |
-| 32768 | 2.4318 | 220.8 | 3.3488 | 160.4 | 1.38x |
+| N | Triton ms | GB/s | Eager ms | GB/s | Compile ms | GB/s | vs eager | vs compile |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 512 | 0.0418 | 200.9 | 0.1041 | 80.6 | 0.0430 | 195.3 | 2.49x | 1.03x |
+| 1024 | 0.0742 | 226.2 | 0.1073 | 156.3 | 0.0777 | 216.0 | 1.45x | 1.05x |
+| 2048 | 0.1445 | 232.3 | 0.1489 | 225.5 | 0.1421 | 236.1 | 1.03x | 0.98x |
+| 4096 | 0.2912 | 230.5 | 0.3825 | 175.5 | 0.2745 | 244.5 | 1.31x | 0.94x |
+| 8192 | 0.5810 | 231.1 | 0.8158 | 164.6 | 0.5429 | 247.3 | 1.40x | 0.93x |
+| 16384 | 1.1291 | 237.8 | 1.6538 | 162.4 | 1.2561 | 213.8 | 1.46x | 1.11x |
+| 32768 | 2.3668 | 226.9 | 3.3431 | 160.6 | 3.0133 | 178.2 | 1.41x | 1.27x |
 
-GB/s counts one read of x, one write of y, and one read each of weight and bias. Eager at N = 512 is noisy between runs (0.0588 ms here, 0.1034 ms in run 1, 80th percentile 0.1043 ms both times), so treat that speedup as somewhere between 1.4x and 2.5x.
+GB/s counts one read of x, one write of y, and one read each of weight and bias.
 
-At N = 32768, the top of the fp16 single-block range, the forward kernel uses 233 of 255 registers with no spills and drops to 221 GB/s.
+Against `torch.compile` the forward is a wash. Inductor's generated kernel is 2 to 7% faster at N = 2048 to 8192 and reaches 247 GB/s there, the highest bandwidth any kernel in this repo has measured on the T4; this kernel plateaus near 231 GB/s. The Triton kernel wins only at N = 16384 and 32768, where inductor's kernel drops to 214 and 178 GB/s. The eager comparison flatters the forward: eager `F.layer_norm` runs at about 160 GB/s from N = 4096 up.
 
-## Backward (run 4, current code)
+Eager at N ≤ 1024 is noisy between runs (0.0588 to 0.1041 ms at 512 across runs 1 to 5), so the small-N eager speedups are not stable numbers.
 
-Run 4 is after the dx kernel's warp cap was lowered from 32 to 8 and the tiled path was removed. See "The tiled experiment" for why.
+At N = 32768, the top of the fp16 single-block range, the forward kernel uses 233 of 255 registers with no spills and drops to 227 GB/s.
 
-| N | Fused ms | GB/s | Split ms | GB/s | Eager ms | GB/s | Default | Speedup, default vs eager |
-|---:|---:|---:|---:|---:|---:|---:|:---|---:|
-| 512 | 0.1106 | 113.8 | 0.1359 | 92.6 | 0.1200 | 104.9 | fused | 1.08x |
-| 1024 | 0.1414 | 177.9 | 0.2066 | 121.8 | 0.1881 | 133.8 | fused | 1.33x |
-| 2048 | 0.2743 | 183.5 | 0.3714 | 135.5 | 0.4140 | 121.6 | fused | 1.51x |
-| 4096 | 0.5196 | 193.7 | 0.7069 | 142.4 | 0.9784 | 102.9 | fused | 1.88x |
-| 8192 | 1.0008 | 201.2 | 1.3768 | 146.2 | 1.9761 | 101.9 | fused | 1.97x |
-| 16384 | 13.1703 | 30.6 | 2.6904 | 149.7 | 4.2494 | 94.8 | split | 1.58x |
-| 32768 | 50.2820 | 16.0 | 6.0267 | 133.6 | 8.8866 | 90.6 | split | 1.47x |
+## Backward (run 5, current code)
+
+Runs 4 and 5 are after the dx kernel's warp cap was lowered from 32 to 8 and the tiled path was removed. See "The tiled experiment" for why. Run 5 adds the compile column; the other columns agree with run 4 within noise.
+
+| N | Fused ms | GB/s | Split ms | GB/s | Eager ms | GB/s | Compile ms | GB/s | Default | vs eager | vs compile |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---|---:|---:|
+| 512 | 0.1107 | 113.6 | 0.1451 | 86.7 | 0.1165 | 108.0 | 0.1120 | 112.3 | fused | 1.05x | 1.01x |
+| 1024 | 0.1451 | 173.5 | 0.2081 | 120.9 | 0.1881 | 133.8 | 0.1966 | 128.0 | fused | 1.30x | 1.35x |
+| 2048 | 0.2754 | 182.8 | 0.3721 | 135.2 | 0.4152 | 121.2 | 0.2640 | 190.7 | fused | 1.51x | 0.96x |
+| 4096 | 0.5178 | 194.4 | 0.7055 | 142.7 | 0.9823 | 102.5 | 0.7527 | 133.7 | fused | 1.90x | 1.45x |
+| 8192 | 0.9948 | 202.4 | 1.3700 | 147.0 | 1.9794 | 101.7 | 1.7740 | 113.5 | fused | 1.99x | 1.78x |
+| 16384 | 12.9467 | 31.1 | 2.7768 | 145.0 | 4.1998 | 95.9 | 3.9416 | 102.2 | split | 1.51x | 1.42x |
+| 32768 | 49.7185 | 16.2 | 5.9427 | 135.5 | 8.8432 | 91.1 | 8.0206 | 100.4 | split | 1.49x | 1.35x |
 
 GB/s counts only the traffic any backward must move: one read each of x and dy and one write of dx. The split path reads more than that, so its real bandwidth is higher than the column shows.
 
-At N = 512 the fused path and eager trade places between runs (1.10x, 0.95x, 1.08x across runs 2 to 4); call it even.
+Against `torch.compile` the backward is a real win: 1.35x to 1.78x at N = 1024 and N ≥ 4096. The exceptions are N = 512, a tie, and N = 2048, where inductor's backward is 4% faster and reaches 191 GB/s, its best width by far. Inductor's backward bandwidth is not monotonic in N (128, 191, 134, 114 GB/s at 1024 to 8192), which suggests its reduction heuristics pick a different strategy at 2048 than on either side; not investigated.
+
+At N = 512 the fused path and eager trade places between runs (1.10x, 0.95x, 1.08x, 1.05x across runs 2 to 5); call it even.
 
 The fused path beats the split path at every N up to 8192, by 1.3 to 1.4 times, so the switch at N = 16384 (`SPLIT_MIN_BLOCK`) stays.
 
-The warp cap changed only the N = 32768 row: split went from 6.66 ms in run 3 to 6.03 ms, matching the 6.0 ms projected from the probe. All other rows are within noise of run 3.
+The warp cap changed only the N = 32768 row: split went from 6.66 ms in run 3 to 6.03 ms in run 4 and 5.94 ms in run 5, matching the 6.0 ms projected from the probe.
 
 ### The N = 16384 cliff
 

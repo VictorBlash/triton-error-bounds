@@ -11,7 +11,7 @@ Contents:
        - bitwise determinism across repeated launches,
        - batch invariance (a row's output does not depend on the other rows).
      Plus a mutation test: a kernel that drops a small bias must be rejected.
-  5. Benchmark with triton.testing.do_bench.
+  5. Benchmark with triton.testing.do_bench: Triton vs eager PyTorch vs torch.compile.
 
 Why a per-element bound: a fixed atol/rtol is too loose where outputs are near zero
 and too tight where they are large, so it both misses faults and raises false alarms.
@@ -19,7 +19,7 @@ and too tight where they are large, so it both misses faults and raises false al
 a rounding-error model instead. This file does the same for this kernel's arithmetic.
 
 Requires a CUDA (or ROCm) GPU with PyTorch and Triton installed.
-Usage: python layernorm_triton.py [--skip-bench]
+Usage: python layernorm_triton.py [--skip-bench] [--no-compile]
 """
 
 from __future__ import annotations
@@ -34,6 +34,7 @@ import triton
 import triton.language as tl
 
 EPS = 1e-5
+BENCH_WIDTHS = (512, 1024, 2048, 4096, 8192, 16384, 32768)
 
 # Fixed tolerances for the eager-mode parity check. They suit fp16, whose spacing near 1.0
 # is about 1e-3. bf16 spacing near 1.0 is 8x larger, so the same tolerance would flag
@@ -61,6 +62,17 @@ DIV_ULPS = 2
 def layer_norm_eager(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, eps: float = EPS) -> torch.Tensor:
     """LayerNorm over the last dimension using PyTorch eager mode."""
     return F.layer_norm(x, (x.shape[-1],), weight, bias, eps)
+
+
+def compiled_layer_norm():
+    """torch.compile of the eager reference, as a benchmark baseline.
+
+    Resets the compiler cache first so each benchmark width gets kernels specialized to
+    its shape instead of hitting the recompile limit. Default inductor mode. The first
+    call per width compiles, which takes a few seconds; do_bench's warmup absorbs it.
+    """
+    torch.compiler.reset()
+    return torch.compile(layer_norm_eager, dynamic=False)
 
 
 # ---------------------------------------------------------------------------
@@ -448,27 +460,34 @@ CASES: list[tuple[tuple[int, ...], torch.dtype, float, str]] = [
 # ---------------------------------------------------------------------------
 
 
-def benchmark(device: str, dtype: torch.dtype = torch.float16, m: int = 4096) -> None:
-    """Print median time and effective bandwidth for Triton vs eager across widths.
+def benchmark(device: str, dtype: torch.dtype = torch.float16, m: int = 4096, compile_baseline: bool = True) -> None:
+    """Print median forward time and effective bandwidth for Triton, eager and torch.compile.
 
     do_bench handles warmup, cache flushing and repeats. Bandwidth counts one read of x,
-    one write of y, and one read each of weight and bias.
+    one write of y, and one read each of weight and bias. The compiled column is
+    inductor's own generated kernel for the same shape, the baseline a custom kernel has
+    to beat to be worth keeping.
     """
-    print(f"\nbenchmark: M={m}, dtype={dtype}, median ms [p20, p80], GB/s")
-    print(f"{'N':>6}  {'triton ms':>22}  {'GB/s':>7}  {'eager ms':>22}  {'GB/s':>7}")
-    for n in (512, 1024, 2048, 4096, 8192, 16384, 32768):
+    names = ["triton", "eager"] + (["compile"] if compile_baseline else [])
+    print(f"\nforward benchmark: M={m}, dtype={dtype}, median ms and GB/s")
+    print(f"{'N':>6}  " + "  ".join(f"{nm + ' ms':>10} {'GB/s':>6}" for nm in names))
+    for n in BENCH_WIDTHS:
         x, w, b = make_inputs((m, n), dtype, device)
         bytes_moved = (2 * m * n + 2 * n) * x.element_size()
+        fns = [layer_norm_triton, layer_norm_eager]
+        if compile_baseline:
+            fns.append(compiled_layer_norm())
         cells = []
-        for fn in (layer_norm_triton, layer_norm_eager):
-            ms, lo, hi = triton.testing.do_bench(lambda fn=fn: fn(x, w, b), quantiles=[0.5, 0.2, 0.8])
-            cells.append(f"{ms:7.4f} [{lo:6.4f}, {hi:6.4f}]  {bytes_moved / (ms * 1e-3) / 1e9:7.1f}")
-        print(f"{n:>6}  {cells[0]}  {cells[1]}")
+        for fn in fns:
+            ms = triton.testing.do_bench(lambda fn=fn: fn(x, w, b))
+            cells.append(f"{ms:10.4f} {bytes_moved / (ms * 1e-3) / 1e9:6.1f}")
+        print(f"{n:>6}  {'  '.join(cells)}")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Triton LayerNorm: correctness checks and benchmark")
     parser.add_argument("--skip-bench", action="store_true", help="run correctness checks only")
+    parser.add_argument("--no-compile", action="store_true", help="leave the torch.compile column out of the benchmark")
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -487,7 +506,7 @@ def main() -> int:
     )
 
     if not args.skip_bench:
-        benchmark(device)
+        benchmark(device, compile_baseline=not args.no_compile)
     return 0
 
 
