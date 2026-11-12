@@ -33,25 +33,23 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from common import (
+    APPROX_MATH_ULPS,
+    U_FP32,
+    ULP_REL_FP32,
+    UNIT_ROUNDOFF,
+    add_err,
+    compile_fresh,
+    mean_err,
+    mul_err,
+    num_warps_for,
+    parity_tolerances,
+    require_cuda,
+    store_err,
+)
+
 EPS = 1e-5
 BENCH_WIDTHS = (512, 1024, 2048, 4096, 8192, 16384, 32768)
-
-# Fixed tolerances for the eager-mode parity check. They suit fp16, whose spacing near 1.0
-# is about 1e-3. bf16 spacing near 1.0 is 8x larger, so the same tolerance would flag
-# correct kernels that round one ulp differently from eager. bf16 tolerances are scaled by 8.
-PARITY_ATOL = 1e-3
-PARITY_RTOL = 1e-3
-
-U_FP32 = 2.0**-24
-# One ulp relative to the value: at most 2**-23 for fp32, twice the unit roundoff.
-ULP_REL_FP32 = 2.0**-23
-UNIT_ROUNDOFF = {torch.float16: 2.0**-11, torch.bfloat16: 2.0**-8}
-HALF_MIN_SUBNORMAL = {torch.float16: 2.0**-25, torch.bfloat16: 2.0**-134}
-# tl.sqrt and fp32 division can lower to approximate GPU instructions. Assume each is
-# within 2 ulp: 4 ulp combined on rstd, 2 ulp on each division by N. Raise these if a GPU
-# or Triton version disagrees.
-APPROX_MATH_ULPS = 4
-DIV_ULPS = 2
 
 
 # ---------------------------------------------------------------------------
@@ -62,17 +60,6 @@ DIV_ULPS = 2
 def layer_norm_eager(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, eps: float = EPS) -> torch.Tensor:
     """LayerNorm over the last dimension using PyTorch eager mode."""
     return F.layer_norm(x, (x.shape[-1],), weight, bias, eps)
-
-
-def compiled_layer_norm():
-    """torch.compile of the eager reference, as a benchmark baseline.
-
-    Resets the compiler cache first so each benchmark width gets kernels specialized to
-    its shape instead of hitting the recompile limit. Default inductor mode. The first
-    call per width compiles, which takes a few seconds; do_bench's warmup absorbs it.
-    """
-    torch.compiler.reset()
-    return torch.compile(layer_norm_eager, dynamic=False)
 
 
 # ---------------------------------------------------------------------------
@@ -151,15 +138,6 @@ def validate_inputs(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -
     return block_size
 
 
-def num_warps_for(block_size: int) -> int:
-    """About 256 elements per warp, between 1 and 8 warps.
-
-    Depends only on the block size, so every launch with the same N runs the same
-    reduction order. Batch invariance needs that.
-    """
-    return min(max(block_size // 256, 1), 8)
-
-
 def layer_norm_triton_fwd(
     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, eps: float = EPS
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -219,55 +197,6 @@ def layer_norm_triton(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor,
 # ---------------------------------------------------------------------------
 # 4. Correctness checks
 # ---------------------------------------------------------------------------
-
-
-def _gamma(k: int) -> float:
-    """Higham's gamma_k for fp32: worst-case relative error of k chained roundings."""
-    return k * U_FP32 / (1.0 - k * U_FP32)
-
-
-# Error-propagation helpers, shared with the backward file. Each takes exact magnitudes
-# (fp64, non-negative) and bounds on how far the kernel's fp32 values are from the exact
-# ones, and returns a bound for the next result, including that operation's own rounding.
-# A fused multiply-add rounds once where these count two roundings, so if the compiler
-# contracts a multiply and an add into an FMA the result stays inside the bound.
-
-
-def mul_err(
-    a: torch.Tensor | float, ea: torch.Tensor | float, b: torch.Tensor | float, eb: torch.Tensor | float
-) -> torch.Tensor:
-    """Bound for fl(a' * b') where a = |exact a|, b = |exact b|, |a' - a| <= ea, |b' - b| <= eb.
-
-    At least one argument must be a tensor; every caller passes one.
-    """
-    return a * eb + b * ea + ea * eb + U_FP32 * (a + ea) * (b + eb)
-
-
-def add_err(s: torch.Tensor, ea: torch.Tensor | float, eb: torch.Tensor | float) -> torch.Tensor:
-    """Bound for fl(a' + b') where s = |exact a + b| and ea, eb bound the input errors."""
-    e = ea + eb
-    return e + U_FP32 * (s + e)
-
-
-def mean_err(t: torch.Tensor, et: torch.Tensor, n: int) -> torch.Tensor:
-    """Bound for fl(sum(t') / n) over the last dim, for any summation order.
-
-    Args:
-        t: exact terms (signed), shape (M, N).
-        et: bound on each computed term's error, same shape.
-        n: number of terms. Adding a masked zero lane is exact, so this is the row width.
-
-    Returns:
-        Bound of shape (M, 1).
-    """
-    sum_err = et.sum(-1, keepdim=True) + _gamma(n - 1) * (t.abs() + et).sum(-1, keepdim=True)
-    e = sum_err / n
-    return e + DIV_ULPS * ULP_REL_FP32 * (t.sum(-1, keepdim=True).abs() / n + e)
-
-
-def store_err(v: torch.Tensor, ev: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-    """Bound after rounding an fp32 value to dtype: round to nearest plus the subnormal floor."""
-    return ev + UNIT_ROUNDOFF[dtype] * (v.abs() + ev) + HALF_MIN_SUBNORMAL[dtype]
 
 
 class RowStats(NamedTuple):
@@ -354,12 +283,6 @@ def layer_norm_reference_with_bound(
     return y_ref.reshape(x.shape), bound.reshape(x.shape)
 
 
-def _parity_tolerances(dtype: torch.dtype) -> tuple[float, float]:
-    """Return (atol, rtol) for the eager parity check, scaled to the dtype's spacing."""
-    scale = UNIT_ROUNDOFF[dtype] / UNIT_ROUNDOFF[torch.float16]
-    return PARITY_ATOL * scale, PARITY_RTOL * scale
-
-
 def check_kernel(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, eps: float = EPS) -> None:
     """Run every correctness check for one input.
 
@@ -371,7 +294,7 @@ def check_kernel(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, eps:
 
     # Check 1: fixed tolerance against eager PyTorch.
     y_eager = layer_norm_eager(x, weight, bias, eps)
-    atol, rtol = _parity_tolerances(x.dtype)
+    atol, rtol = parity_tolerances(x.dtype)
     diff = (y.float() - y_eager.float()).abs()
     assert torch.allclose(y, y_eager, atol=atol, rtol=rtol), (
         f"allclose vs eager failed: max |diff| {diff.max().item():.3e} (atol={atol}, rtol={rtol})"
@@ -425,7 +348,7 @@ def check_oracle_rejects_dropped_bias(device: str) -> bool:
     y_ref, bound = layer_norm_reference_with_bound(x, w, b)
     assert ((mutant.double() - y_ref).abs() > bound).any(), "per-element bound accepted a kernel that drops the bias"
 
-    atol, rtol = _parity_tolerances(torch.float16)
+    atol, rtol = parity_tolerances(torch.float16)
     return not torch.allclose(mutant, layer_norm_eager(x, w, b), atol=atol, rtol=rtol)
 
 
@@ -476,7 +399,7 @@ def benchmark(device: str, dtype: torch.dtype = torch.float16, m: int = 4096, co
         bytes_moved = (2 * m * n + 2 * n) * x.element_size()
         fns = [layer_norm_triton, layer_norm_eager]
         if compile_baseline:
-            fns.append(compiled_layer_norm())
+            fns.append(compile_fresh(layer_norm_eager))
         cells = []
         for fn in fns:
             ms = triton.testing.do_bench(lambda fn=fn: fn(x, w, b))
@@ -490,10 +413,9 @@ def main() -> int:
     parser.add_argument("--no-compile", action="store_true", help="leave the torch.compile column out of the benchmark")
     args = parser.parse_args()
 
-    if not torch.cuda.is_available():
-        print("A CUDA or ROCm GPU is required: Triton compiles kernels for the GPU.", file=sys.stderr)
+    device = require_cuda()
+    if device is None:
         return 1
-    device = "cuda"
 
     for shape, dtype, offset, why in CASES:
         check_kernel(*make_inputs(shape, dtype, device, offset))

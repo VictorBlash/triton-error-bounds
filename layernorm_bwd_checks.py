@@ -31,23 +31,28 @@ import torch
 import triton
 import triton.language as tl
 
+from common import (
+    U_FP32,
+    add_err,
+    assert_close,
+    assert_within_bound,
+    compile_fresh,
+    gamma,
+    mean_err,
+    mul_err,
+    parity_tolerances,
+    require_cuda,
+    store_err,
+)
 from layernorm_triton import (
     BENCH_WIDTHS,
     CASES,
     EPS,
-    U_FP32,
     RowStats,
-    _gamma,
-    _parity_tolerances,
-    add_err,
-    compiled_layer_norm,
     layer_norm_eager,
     layer_norm_triton_fwd,
     make_inputs,
-    mean_err,
-    mul_err,
     row_stats_with_error,
-    store_err,
 )
 from layernorm_triton_bwd import PATHS, default_path, layer_norm_autograd, layer_norm_triton_bwd
 
@@ -94,8 +99,8 @@ def _dwdb_with_bound(dy64: torch.Tensor, st: RowStats) -> tuple[torch.Tensor, to
     xhat_err = mul_err(st.xc.abs(), st.xc_err, st.rstd, st.rstd * st.rstd_rel)
     t = dy64 * xhat
     t_err = mul_err(dy64.abs(), 0.0, xhat.abs(), xhat_err)
-    dw_err = t_err.sum(0) + _gamma(m - 1) * (t.abs() + t_err).sum(0)
-    db_err = _gamma(m - 1) * dy64.abs().sum(0)
+    dw_err = t_err.sum(0) + gamma(m - 1) * (t.abs() + t_err).sum(0)
+    db_err = gamma(m - 1) * dy64.abs().sum(0)
     return t.sum(0), dw_err, dy64.sum(0), db_err
 
 
@@ -150,23 +155,6 @@ def _eager_grads(dy: torch.Tensor, x: torch.Tensor, weight: torch.Tensor, bias: 
     return xg.grad, wg.grad, bg.grad
 
 
-def _assert_close(name: str, got: torch.Tensor, want: torch.Tensor, atol: float, rtol: float) -> None:
-    diff = (got.double() - want.double()).abs()
-    assert torch.allclose(got.double(), want.double(), atol=atol, rtol=rtol), (
-        f"{name}: max |diff| {diff.max().item():.3e} (atol={atol}, rtol={rtol})"
-    )
-
-
-def _assert_within_bound(name: str, got: torch.Tensor, ref: torch.Tensor, bound: torch.Tensor) -> None:
-    excess = (got.double() - ref).abs() - bound
-    worst = int(excess.argmax())
-    assert (excess <= 0).all(), (
-        f"{name}: per-element bound exceeded at flat index {worst}: "
-        f"got={got.flatten()[worst].item():.6g}, ref={ref.flatten()[worst].item():.6g}, "
-        f"bound={bound.flatten()[worst].item():.3e}"
-    )
-
-
 def _check_path(
     path: str,
     dy: torch.Tensor,
@@ -192,15 +180,15 @@ def _check_path(
 
     # Fixed tolerance against eager autograd. dw and db are sums over M rows, so their
     # magnitude grows with M: rtol does the work, atol scales with M for values near zero.
-    atol, rtol = _parity_tolerances(x.dtype)
+    atol, rtol = parity_tolerances(x.dtype)
     m = x.reshape(-1, x.shape[-1]).shape[0]
     for name, g, r, a in zip(("dx", "dw", "db"), got, want_eager, (atol, atol * m, atol * m), strict=True):
-        _assert_close(f"{path} {name} vs eager", g, r, a, rtol)
+        assert_close(f"{path} {name} vs eager", g, r, a, rtol)
 
     # Per-element bound against fp64. Tighter than allclose where gradients are small,
     # and catches a kernel that matches eager only because both share a bug.
     for name, g, r, b in zip(("dx", "dw", "db"), got, *want_fp64, strict=True):
-        _assert_within_bound(f"{path} {name} vs fp64", g, r, b)
+        assert_within_bound(f"{path} {name} vs fp64", g, r, b)
 
     again = layer_norm_triton_bwd(dy, x, weight, mean, rstd, path=path)
     assert all(torch.equal(a, b) for a, b in zip(got, again, strict=True)), f"{path}: two launches differ"
@@ -289,14 +277,14 @@ def check_bound_rejects_mutants(device: str) -> dict[str, bool]:
     for path in PATHS:
         got = layer_norm_triton_bwd(dy, x, w, mean, rstd, path=path)
         for name, gt, r, bd in zip(("dx", "dw", "db"), got, refs, bounds, strict=True):
-            _assert_within_bound(f"{path} {name} with small dy", gt, r, bd)
+            assert_within_bound(f"{path} {name} with small dy", gt, r, bd)
 
     dx_bad = torch.empty_like(x)
     _mutant_dx_drop_c1_kernel[(m,)](dy, w, rstd, dx_bad, n, BLOCK_SIZE=triton.next_power_of_2(n))
     _, dw_bad, db_bad = layer_norm_triton_bwd(dy[:-1], x[:-1], w, mean[:-1], rstd[:-1], path="split")
 
     eager = _eager_grads(dy, x, w, b, EPS)
-    atol, rtol = _parity_tolerances(torch.float16)
+    atol, rtol = parity_tolerances(torch.float16)
     mutants = (
         ("dx drops the c1 term", dx_bad, 0, atol),
         ("dw skips the last row", dw_bad, 1, atol * m),
@@ -357,7 +345,7 @@ def benchmark(device: str, dtype: torch.dtype = torch.float16, m: int = 4096, co
         ]
         runs.append(_backward_runner(layer_norm_eager, x, w, b, dy))
         if compile_baseline:
-            runs.append(_backward_runner(compiled_layer_norm(), x, w, b, dy))
+            runs.append(_backward_runner(compile_fresh(layer_norm_eager), x, w, b, dy))
         cells = []
         for fn in runs:
             ms = triton.testing.do_bench(fn)
@@ -371,10 +359,9 @@ def main() -> int:
     parser.add_argument("--no-compile", action="store_true", help="leave the torch.compile column out of the benchmark")
     args = parser.parse_args()
 
-    if not torch.cuda.is_available():
-        print("A CUDA or ROCm GPU is required: Triton compiles kernels for the GPU.", file=sys.stderr)
+    device = require_cuda()
+    if device is None:
         return 1
-    device = "cuda"
 
     for shape, dtype, offset, why in CASES:
         check_backward(*make_inputs(shape, dtype, device, offset))

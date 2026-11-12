@@ -24,13 +24,13 @@ from collections.abc import Callable
 import torch
 import triton
 
+from common import num_warps_for
 from layernorm_triton import (
     EPS,
     _layer_norm_fwd_kernel,
     layer_norm_eager,
     layer_norm_triton_fwd,
     make_inputs,
-    num_warps_for,
 )
 from layernorm_triton_bwd import (
     DWDB_BLOCK_N,

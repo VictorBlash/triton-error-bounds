@@ -40,7 +40,8 @@ import torch
 import triton
 import triton.language as tl
 
-from layernorm_triton import EPS, layer_norm_triton_fwd, num_warps_for, validate_inputs
+from common import num_warps_for
+from layernorm_triton import EPS, layer_norm_triton_fwd, validate_inputs
 
 PATHS = ("fused", "split")
 
