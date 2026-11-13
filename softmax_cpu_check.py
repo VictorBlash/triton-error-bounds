@@ -7,9 +7,9 @@ for step in fp32, and reject the two mutants. Use it before spending GPU time on
 to the error model. Prints, per case and path, the largest |error| / bound seen: 1.0 or
 more is a failure, below 1 is slack.
 
-What it cannot check: the GPU's exp and division are approximate, and EXP_ULPS and
-DIV_ULPS budget for that. CPU math is correctly rounded, so only the GPU run tests those
-budgets.
+What it cannot check: the GPU's exp and division are approximate, and EXP_ULPS,
+EXP_ARG_ULPS and DIV_ULPS budget for that from NVIDIA's documented error bounds. CPU math
+is correctly rounded, so only the GPU run tests those budgets.
 
 Usage: python softmax_cpu_check.py            (needs torch; triton optional)
    or: uv run --with torch python softmax_cpu_check.py

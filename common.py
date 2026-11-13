@@ -31,8 +31,13 @@ HALF_MIN_SUBNORMAL = {torch.float16: 2.0**-25, torch.bfloat16: 2.0**-134}
 # result, beyond whatever error the operation inherits from its inputs. Raise one if a GPU
 # or Triton version disagrees, and record why in RESULTS.md.
 APPROX_MATH_ULPS = 4  # tl.sqrt followed by an fp32 division, combined (LayerNorm's rstd)
-DIV_ULPS = 2  # one fp32 division
-EXP_ULPS = 4  # one tl.exp call
+DIV_ULPS = 2  # one fp32 division: div.full.f32, documented at 2 ulps
+# fp32 tl.exp lowers to ex2.approx(x * log2e) on NVIDIA (Triton ElementwiseOpToLLVM.cpp).
+# CUDA documents that same sequence as __expf: max error 2 + floor(|1.173 x|) ulps (CUDA
+# C++ Programming Guide, Mathematical Functions appendix, intrinsic table). The argument
+# term exists because the scaled exponent x * log2e is rounded, so the error grows with |x|.
+EXP_ULPS = 2  # fixed part per tl.exp call
+EXP_ARG_ULPS = 1.173  # per unit of |argument|, per tl.exp call
 
 # Fixed tolerances for the eager-mode parity check. They suit fp16, whose spacing near 1.0
 # is about 1e-3. bf16 spacing near 1.0 is 8x larger, so the same tolerance would flag
@@ -99,9 +104,10 @@ def exp_err(d_abs: torch.Tensor, ed: torch.Tensor | float, calls: int = 1, muls:
 
     Covers a chain of `calls` exp evaluations multiplied together with `muls` fp32
     multiplies, as in online softmax where exp(x - m_t) is later rescaled by
-    exp(m_t - m_{t+1}) and so on. The chained arguments telescope to d when the running
-    maxes are monotone, so one absolute argument error `ed` plus the per-call scaling
-    rounding u32 * |d| covers every link of the chain.
+    exp(m_t - m_{t+1}) and so on. Each call costs EXP_ULPS plus EXP_ARG_ULPS per unit of
+    its own |argument|. The chained arguments telescope to d when the running maxes are
+    monotone, so the argument terms sum to EXP_ARG_ULPS * |d| over the whole chain, and
+    one absolute argument error `ed` covers every link.
 
     Args:
         d_abs: exact |d|, where the chain computes exp(d).
@@ -112,7 +118,7 @@ def exp_err(d_abs: torch.Tensor, ed: torch.Tensor | float, calls: int = 1, muls:
     Returns:
         Relative error bound, same shape as d_abs.
     """
-    arg = torch.expm1(ed + U_FP32 * d_abs)
+    arg = torch.expm1(ed + EXP_ARG_ULPS * ULP_REL_FP32 * (d_abs + ed))
     return (1.0 + arg) * (1.0 + EXP_ULPS * ULP_REL_FP32) ** calls * (1.0 + U_FP32) ** muls - 1.0
 
 

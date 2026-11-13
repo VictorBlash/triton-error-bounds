@@ -144,7 +144,18 @@ Decision: drop the tiled path and cap the dx kernel at 8 warps. Projected split 
 
 The first backward benchmark reported Triton as 2 to 2.8 times faster than eager. That eager timing was wrong. Each repeated `.backward()` call added into the existing `.grad`, which costs an extra read and write of dx per call. The benchmark now clears the gradients before each call, and eager at N = 16384 went from 5.89 ms to 4.22 ms. Use the tables above, not the first run.
 
+## Softmax (GPU run pending)
+
+The softmax kernels, checks and benchmarks are in `softmax_triton.py` and `softmax_checks.py`. They have not run on a GPU yet; `softmax_cpu_check.py` passes against an fp32 emulation (0 failures, both mutants rejected by more than 400x).
+
+### The exp error budget
+
+fp32 `tl.exp` lowers to `ex2.approx.f32` after an fp32 multiply by log2(e) (Triton, `third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/ElementwiseOpToLLVM.cpp`, `ExpOpConversionApprox`). That is the same instruction sequence as CUDA's `__expf`, which the CUDA C++ Programming Guide's Mathematical Functions appendix documents at 2 + floor(|1.173 x|) ulps. The scaled exponent x * log2(e) is rounded, so the error grows with |x|.
+
+The first model charged 4 ulps per call plus half an ulp per unit of |argument|. That is above the documented bound for |x| below 3 and below it beyond: 1.2x short at |x| = 6, 1.36x at 10, 1.46x at 20. In a softmax row most arguments x - max sit between -3 and -6, and the fp16 store term uses almost the whole bound (CPU ratios up to 0.998), so a GPU run could have failed on a few elements for a reason that had nothing to do with the kernel. The model now follows the documentation: `EXP_ULPS = 2` fixed per call and `EXP_ARG_ULPS = 1.173` per unit of |argument|, both in `common.py`. The CPU ratios did not move, because the store term dominates there.
+
 ## Open items
 
+- The GPU run of the softmax checks is pending (Colab's free quota ran out on 2026-11-11). It is the only test of the exp and division budgets above; CPU math is correctly rounded.
 - At N = 32768 the dx kernel keeps 26 spill instructions at 8 warps and runs at 207 GB/s against 247 GB/s at N = 16384. Accepted: the measured alternative was slower, and 32768 is the top of the fp16 single-block range.
 - All numbers are from one GPU model. The switch point and the warp cap are T4 measurements; rerun `probe_spills.py` and both benchmarks before trusting them on another GPU.
