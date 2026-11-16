@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import argparse
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 
 import torch
 import torch.nn.functional as F
@@ -413,8 +413,14 @@ def _backward_runner(
     return run
 
 
-def _print_table(title: str, names: list[str], rows: list[tuple[int, list[Callable[[], object] | None], int]]) -> None:
-    """Time each callable with do_bench and print one row per width. None prints a dash."""
+def _print_table(
+    title: str, names: list[str], rows: Iterable[tuple[int, list[Callable[[], object] | None], int]]
+) -> None:
+    """Time each callable with do_bench and print one row per width. None prints a dash.
+
+    `rows` is consumed one width at a time. Pass a generator, not a list: each width's
+    tensors and its fresh torch.compile cache must exist only while that width is timed.
+    """
     print(f"\n{title}, median ms and GB/s")
     print(f"{'N':>6}  " + "  ".join(f"{nm + ' ms':>10} {'GB/s':>6}" for nm in names))
     for n, fns, nbytes in rows:
@@ -451,7 +457,7 @@ def benchmark(device: str, dtype: torch.dtype = torch.float16, m: int = 4096, co
                 fns.append(lambda x=x, c=compiled: c(x))
             yield n, fns, 2 * m * n * esize
 
-    _print_table(f"softmax forward: M={m}, dtype={dtype}", names, list(fwd_rows()))
+    _print_table(f"softmax forward: M={m}, dtype={dtype}", names, fwd_rows())
 
     names = [*BWD_PATHS, "eager"] + (["compile"] if compile_baseline else [])
 
@@ -469,7 +475,7 @@ def benchmark(device: str, dtype: torch.dtype = torch.float16, m: int = 4096, co
                 fns.append(_backward_runner(compile_fresh(softmax_eager), x, dy))
             yield n, fns, 3 * m * n * esize
 
-    _print_table(f"softmax backward: M={m}, dtype={dtype}", names, list(bwd_rows()))
+    _print_table(f"softmax backward: M={m}, dtype={dtype}", names, bwd_rows())
 
 
 def main() -> int:
