@@ -1,6 +1,6 @@
 # Triton LayerNorm and softmax: GPU results
 
-The LayerNorm sections were measured on Google Colab, November 2026. The softmax section was measured on Kaggle with older library versions; its environment is stated there. Colab:
+The first LayerNorm sections were measured on Google Colab, November 2026. Everything from "LayerNorm on the Kaggle versions" down was measured on Kaggle with older library versions; the environment is stated there. Colab:
 
 - GPU: NVIDIA Tesla T4, 16 GB, about 320 GB/s peak memory bandwidth. The best any kernel here reaches is about 250 GB/s, and that is treated as the practical ceiling.
 - torch 2.14.1+cu130, triton 3.8.0.
@@ -144,17 +144,50 @@ Decision: drop the tiled path and cap the dx kernel at 8 warps. Projected split 
 
 The first backward benchmark reported Triton as 2 to 2.8 times faster than eager. That eager timing was wrong. Each repeated `.backward()` call added into the existing `.grad`, which costs an extra read and write of dx per call. The benchmark now clears the gradients before each call, and eager at N = 16384 went from 5.89 ms to 4.22 ms. Use the tables above, not the first run.
 
-## Softmax (Kaggle, 2026-11-16)
+## Kaggle environment (2026-11-16)
 
-The softmax kernels, checks and benchmarks are in `softmax_triton.py` and `softmax_checks.py`, at commit `1bfef9e`.
-
-Measured on a Kaggle notebook with the "GPU T4 x2" accelerator; the scripts use the first GPU.
+Everything below ran on Kaggle's "GPU T4 x2" accelerator; the scripts use the first GPU.
 
 - GPU: NVIDIA Tesla T4.
-- torch 2.11.0+cu130, triton 3.6.0. Both are older than the Colab versions above (torch 2.14.1, triton 3.8.0), so compare the softmax columns with each other, not with the LayerNorm tables.
-- One run. Nothing in this section has been repeated, so differences of a few percent are not established.
+- torch 2.11.0+cu130, triton 3.6.0. Both are older than the Colab versions above (torch 2.14.1, triton 3.8.0).
+- Timings use M = 4096 rows, fp16, the median from `do_bench`, and one fresh `torch.compile` per width, as in the Colab tables.
+- The tables are from one job, pushed by `kaggle_run.py run --bench` from a clean tree at commit `7b0c7f8`. The job prints the commit it was built from.
 
-Timings use M = 4096 rows, fp16, the median from `do_bench`, and one fresh `torch.compile` per width, as in the LayerNorm tables.
+## LayerNorm on the Kaggle versions
+
+One run. The checks pass, as they did on Colab.
+
+| N | Triton ms | GB/s | Eager ms | GB/s | Compile ms | GB/s | vs eager | vs compile |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 512 | 0.0437 | 192.0 | 0.1038 | 80.8 | 0.0434 | 193.4 | 2.38x | 0.99x |
+| 1024 | 0.0758 | 221.5 | 0.0873 | 192.2 | 0.0762 | 220.1 | 1.15x | 1.01x |
+| 2048 | 0.1476 | 227.4 | 0.1477 | 227.3 | 0.1425 | 235.5 | 1.00x | 0.97x |
+| 4096 | 0.2939 | 228.4 | 0.3839 | 174.8 | 0.2794 | 240.3 | 1.31x | 0.95x |
+| 8192 | 0.5879 | 228.4 | 0.8254 | 162.7 | 0.5616 | 239.0 | 1.40x | 0.96x |
+| 16384 | 1.1544 | 232.6 | 1.6675 | 161.0 | 1.1211 | 239.5 | 1.44x | 0.97x |
+| 32768 | 2.5138 | 213.6 | 3.3574 | 159.9 | 2.4566 | 218.6 | 1.34x | 0.98x |
+
+| N | Fused ms | GB/s | Split ms | GB/s | Eager ms | GB/s | Compile ms | GB/s | Default | vs eager | vs compile |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---|---:|---:|
+| 512 | 0.1122 | 112.2 | 0.1474 | 85.4 | 0.1343 | 93.7 | 0.1062 | 118.5 | fused | 1.20x | 0.95x |
+| 1024 | 0.1413 | 178.1 | 0.2056 | 122.4 | 0.1880 | 133.9 | 0.1938 | 129.8 | fused | 1.33x | 1.37x |
+| 2048 | 0.2665 | 188.9 | 0.3711 | 135.6 | 0.4151 | 121.3 | 0.2630 | 191.3 | fused | 1.56x | 0.99x |
+| 4096 | 0.5187 | 194.1 | 0.7054 | 142.7 | 0.9796 | 102.8 | 0.7474 | 134.7 | fused | 1.89x | 1.44x |
+| 8192 | 1.0027 | 200.8 | 1.3784 | 146.1 | 1.9784 | 101.8 | 1.7668 | 114.0 | fused | 1.97x | 1.76x |
+| 16384 | 12.4660 | 32.3 | 2.7047 | 148.9 | 4.2251 | 95.3 | 3.9207 | 102.7 | split | 1.56x | 1.45x |
+| 32768 | 65.0506 | 12.4 | 6.5837 | 122.3 | 8.8166 | 91.3 | 7.9166 | 101.7 | split | 1.34x | 1.20x |
+
+Against the Colab run 5 tables:
+
+- The forward no longer beats `torch.compile` at any width: 0.95x to 1.01x. On Colab it won at N = 16384 and 32768 (1.11x and 1.27x). The difference is inductor, not this kernel. Inductor's forward on torch 2.11.0 takes 1.12 ms at 16384 and 2.46 ms at 32768, against 1.26 and 3.01 ms on torch 2.14.1, and it holds 219 to 240 GB/s where the newer version dropped to 214 and 178. So the forward's only wins over inductor depend on the torch version.
+- The backward conclusion holds: 1.37x to 1.76x over inductor at N = 1024, 4096, 8192 and 16384, a tie at 512 and 2048, and 1.20x at 32768 (1.35x on Colab).
+- The Triton kernels themselves are within 3% of Colab up to N = 16384, apart from the forward at 512 (4.5% slower). At N = 32768 both are slower on triton 3.6.0: the forward by 6% (214 against 227 GB/s) and the split backward by 11% (6.58 against 5.94 ms). `probe_spills.py` was not run on this version, so the cause is not known.
+
+## Softmax
+
+The softmax kernels, checks and benchmarks are in `softmax_triton.py` and `softmax_checks.py`.
+
+The tables are the second of two runs on this environment. The first, a day earlier in a hand-driven notebook at commit `1bfef9e`, agrees within 0.4% in every backward cell and within 3.2% in every forward cell except three: online and compile at N = 512 (9 to 10%) and eager at N = 4096 (6%). The softmax block forward plateaus at 230 GB/s and the LayerNorm forward at 228 GB/s on the same versions.
 
 ### Correctness
 
@@ -169,30 +202,30 @@ Timings use M = 4096 rows, fp16, the median from `do_bench`, and one fresh `torc
 | Online forward skips the rescale of the running sum | rejected | missed |
 | Backward drops the `sum(dy * y)` term | rejected | missed |
 
-This run is the first test of the exp and division budgets (`EXP_ULPS`, `EXP_ARG_ULPS`, `DIV_ULPS`). On the CPU those operations are correctly rounded, so `softmax_cpu_check.py` could not exercise them. They held on every element of every case. The run shows the budgets are large enough on this GPU for these inputs. It does not show how much slack is left: the GPU checks report pass or fail, not the ratio of error to bound.
+These runs are the first test of the exp and division budgets (`EXP_ULPS`, `EXP_ARG_ULPS`, `DIV_ULPS`). On the CPU those operations are correctly rounded, so `softmax_cpu_check.py` could not exercise them. They held on every element of every case.
 
-The two LayerNorm check scripts were run with `--skip-bench` in the same session and passed every check, so the LayerNorm kernels and bounds also hold on torch 2.11.0 and triton 3.6.0. The LayerNorm benchmarks were not rerun there.
+The checks also print the largest |error| / bound per path. Leaving out the results that are exact (N = 1, and y for uniform rows), it is 0.862 to 0.996 for y and 0.902 to 0.997 for dx, and the block and online paths agree to within 0.001. That ratio is close to 1 by construction: rounding the result to fp16 or bf16 is almost the whole bound, and some element always lands near a rounding boundary. It shows the bound is not loose. It does not show how much of the fp32 budgets is used; "Approximate-math budgets, measured" below does.
 
 ### Forward
 
 | N | Block ms | GB/s | Online ms | GB/s | Eager ms | GB/s | Compile ms | GB/s | Default | vs eager | vs compile |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|:---|---:|---:|
-| 512 | 0.0396 | 212.0 | 0.0492 | 170.4 | 0.0477 | 175.8 | 0.0432 | 194.3 | block | 1.20x | 1.09x |
-| 1024 | 0.0736 | 227.9 | 0.0728 | 230.4 | 0.0817 | 205.4 | 0.0774 | 216.8 | block | 1.11x | 1.05x |
-| 2048 | 0.1452 | 231.1 | 0.1416 | 237.0 | 0.1695 | 197.9 | 0.1428 | 235.0 | block | 1.17x | 0.98x |
-| 4096 | 0.2923 | 229.6 | 0.2954 | 227.1 | 0.3823 | 175.6 | 0.2975 | 225.6 | block | 1.31x | 1.02x |
-| 8192 | 0.5853 | 229.3 | 0.7684 | 174.7 | 0.6702 | 200.3 | 0.5781 | 232.2 | block | 1.15x | 0.99x |
-| 16384 | 1.1663 | 230.2 | 1.6779 | 160.0 | 1.1161 | 240.5 | 1.2704 | 211.3 | block | 0.96x | 1.09x |
-| 32768 | 2.3056 | 232.9 | 3.3370 | 160.9 | 3.1429 | 170.8 | 3.0619 | 175.3 | block | 1.36x | 1.33x |
-| 65536 | - | - | 6.6658 | 161.1 | 8.4629 | 126.9 | 6.6063 | 162.5 | online | 1.27x | 0.99x |
+| 512 | 0.0396 | 212.0 | 0.0447 | 187.7 | 0.0496 | 169.1 | 0.0390 | 215.0 | block | 1.25x | 0.98x |
+| 1024 | 0.0753 | 222.8 | 0.0728 | 230.4 | 0.0805 | 208.4 | 0.0772 | 217.3 | block | 1.07x | 1.03x |
+| 2048 | 0.1448 | 231.7 | 0.1416 | 237.0 | 0.1707 | 196.5 | 0.1427 | 235.1 | block | 1.18x | 0.99x |
+| 4096 | 0.2925 | 229.5 | 0.2941 | 228.2 | 0.4050 | 165.7 | 0.2954 | 227.2 | block | 1.38x | 1.01x |
+| 8192 | 0.5847 | 229.5 | 0.7672 | 174.9 | 0.6882 | 195.0 | 0.5634 | 238.2 | block | 1.18x | 0.96x |
+| 16384 | 1.1652 | 230.4 | 1.6815 | 159.6 | 1.1135 | 241.1 | 1.3109 | 204.8 | block | 0.96x | 1.13x |
+| 32768 | 2.3025 | 233.2 | 3.3277 | 161.3 | 3.1410 | 170.9 | 3.0833 | 174.1 | block | 1.36x | 1.34x |
+| 65536 | - | - | 6.6515 | 161.4 | 8.4716 | 126.7 | 6.6028 | 162.6 | online | 1.27x | 0.99x |
 
 GB/s counts one read of x and one write of y. The online path reads x twice, so its real bandwidth is higher than the column shows. The two "vs" columns compare the default path.
 
-- Against `torch.compile` the forward is a tie: 0.98x to 1.09x at every width except N = 32768. There inductor's kernel drops to 175 GB/s and the block kernel wins by 1.33x. Inductor's LayerNorm forward dropped at the same width (178 GB/s).
-- The block kernel holds 228 to 233 GB/s from N = 1024 to 32768. That is the same plateau as the LayerNorm forward (about 231 GB/s).
-- Eager `F.softmax` is not monotonic: 176 to 240 GB/s up to N = 16384, then 171 and 127 GB/s. At N = 16384 eager was 4% faster than the block kernel. With one run, that row is not settled either way.
+- Against `torch.compile` the forward is a tie up to N = 8192 (0.96x to 1.03x) and at 65536 (0.99x). The block kernel wins at N = 16384 (1.13x; 1.09x in the first run) and at N = 32768 (1.34x), where inductor's softmax drops to 205 and 174 GB/s.
+- The block kernel holds 223 to 233 GB/s from N = 1024 to 32768.
+- Eager `F.softmax` is not monotonic: 166 to 241 GB/s up to N = 16384, then 171 and 127 GB/s. At N = 16384 eager is 4% faster than the block kernel, in both runs. That is the one width where this forward loses to eager.
 - Above the block limit the online kernel ties inductor (0.99x) and beats eager by 1.27x.
-- The online kernel matches the block kernel where the row is one tile and wide enough to amortise its extra loop (N = 1024 to 4096, within 2.5%), is 24% slower at N = 512, and is 1.3 to 1.45 times slower from N = 8192 up. Counting its real traffic (x read twice, y written once) it moves 240 GB/s at N = 16384 and above. It is at the bandwidth ceiling and slow only because it moves 3/2 the bytes. This is the same result as the LayerNorm tiled experiment.
+- The online kernel matches the block kernel where the row is one tile and wide enough to amortise its extra loop (N = 1024 to 4096, within 3%), is 13% slower at N = 512 (24% in the first run), and is 1.3 to 1.45 times slower from N = 8192 up. Counting its real traffic (x read twice, y written once) it moves 240 GB/s at N = 16384 and above. It is at the bandwidth ceiling and slow only because it moves 3/2 the bytes. This is the same result as the LayerNorm tiled experiment.
 
 Decision: keep `BLOCK_LIMIT = 32768`. The block path is the default wherever a row fits one block, and the online path is used only above that.
 
@@ -200,36 +233,71 @@ Decision: keep `BLOCK_LIMIT = 32768`. The block path is the default wherever a r
 
 | N | Block ms | GB/s | Tiled ms | GB/s | Eager ms | GB/s | Compile ms | GB/s | Default | vs eager | vs compile |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|:---|---:|---:|
-| 512 | 0.0570 | 220.7 | 0.0569 | 221.1 | 0.1145 | 109.9 | 0.0566 | 222.2 | block | 2.01x | 0.99x |
-| 1024 | 0.1095 | 229.8 | 0.1097 | 229.3 | 0.2189 | 115.0 | 0.1097 | 229.3 | block | 2.00x | 1.00x |
-| 2048 | 0.2112 | 238.3 | 0.2066 | 243.6 | 0.4164 | 120.9 | 0.2122 | 237.2 | block | 1.97x | 1.00x |
-| 4096 | 0.4267 | 235.9 | 0.4934 | 204.0 | 0.8263 | 121.8 | 0.4132 | 243.6 | block | 1.94x | 0.97x |
-| 8192 | 0.8409 | 239.4 | 1.3302 | 151.4 | 1.6374 | 123.0 | 0.8485 | 237.3 | block | 1.95x | 1.01x |
-| 16384 | 1.6727 | 240.7 | 2.6908 | 149.6 | 3.2585 | 123.6 | 1.6867 | 238.7 | block | 1.95x | 1.01x |
-| 32768 | 3.5330 | 227.9 | 5.4208 | 148.6 | 7.5405 | 106.8 | 4.3205 | 186.4 | block | 2.13x | 1.22x |
-| 65536 | - | - | 10.8640 | 148.3 | 15.1361 | 106.4 | 10.8320 | 148.7 | tiled | 1.39x | 1.00x |
+| 512 | 0.0572 | 220.1 | 0.0568 | 221.3 | 0.1144 | 110.0 | 0.0565 | 222.5 | block | 2.00x | 0.99x |
+| 1024 | 0.1098 | 229.2 | 0.1098 | 229.3 | 0.2188 | 115.0 | 0.1098 | 229.3 | block | 1.99x | 1.00x |
+| 2048 | 0.2112 | 238.4 | 0.2068 | 243.4 | 0.4165 | 120.8 | 0.2121 | 237.3 | block | 1.97x | 1.00x |
+| 4096 | 0.4266 | 236.0 | 0.4924 | 204.4 | 0.8237 | 122.2 | 0.4145 | 242.8 | block | 1.93x | 0.97x |
+| 8192 | 0.8385 | 240.1 | 1.3281 | 151.6 | 1.6337 | 123.2 | 0.8465 | 237.8 | block | 1.95x | 1.01x |
+| 16384 | 1.6691 | 241.2 | 2.6878 | 149.8 | 3.2543 | 123.7 | 1.6813 | 239.5 | block | 1.95x | 1.01x |
+| 32768 | 3.5260 | 228.4 | 5.4153 | 148.7 | 7.5304 | 106.9 | 4.3165 | 186.6 | block | 2.14x | 1.22x |
+| 65536 | - | - | 10.8436 | 148.5 | 15.1162 | 106.5 | 10.8258 | 148.8 | tiled | 1.39x | 1.00x |
 
 GB/s counts one read each of dy and y and one write of dx. The tiled path reads dy and y twice.
 
-- Against `torch.compile` the backward is also a tie: 0.97x to 1.01x, except 1.22x at N = 32768 where inductor drops to 186 GB/s. Unlike LayerNorm, the custom softmax backward does not beat inductor. The softmax backward is one reduction and one elementwise pass, and inductor already generates that at 222 to 244 GB/s up to N = 16384.
+- Against `torch.compile` the backward is also a tie: 0.97x to 1.01x, except 1.22x at N = 32768 where inductor drops to 187 GB/s. Unlike LayerNorm, the custom softmax backward does not beat inductor. The softmax backward is one reduction and one elementwise pass, and inductor already generates that at 222 to 243 GB/s up to N = 16384.
 - Against eager the block path is 1.9 to 2.1 times faster at every width it runs. Eager autograd for softmax runs at 106 to 124 GB/s.
-- The tiled path ties the block path up to N = 2048, is 16% slower at 4096 and 1.5 to 1.6 times slower above. Counting its real traffic (5/3 of the minimum) it moves 247 to 249 GB/s from N = 16384 up: at the ceiling, and slow only because it moves more bytes.
-- At N = 65536 the tiled kernel and inductor take the same time (10.86 and 10.83 ms).
+- The tiled path ties the block path up to N = 2048, is 15% slower at 4096 and 1.5 to 1.6 times slower above. Counting its real traffic (5/3 of the minimum) it moves 247 to 250 GB/s from N = 16384 up: at the ceiling, and slow only because it moves more bytes.
+- At N = 65536 the tiled kernel and inductor take the same time (10.84 and 10.83 ms).
 
 Decision: the block path stays the default up to N = 32768 and the tiled path is used only above it.
 
 What softmax adds to this repo is therefore not speed over inductor. It is the error model exercised on approximate GPU exp and division, and kernels that are checked per element for rows wider than one block.
 
+## Approximate-math budgets, measured
+
+The bounds charge the GPU's approximate math a budget: `EXP_ULPS` and `EXP_ARG_ULPS` for `tl.exp`, `DIV_ULPS` for a division, `APPROX_MATH_ULPS` for LayerNorm's 1 / sqrt. The kernel checks cannot show how much of a budget is used, because the fp16 or bf16 store rounding is hundreds of times larger. `probe_math.py` runs each operation alone in fp32, written as the kernels write it, and compares every element with fp64. Same Kaggle job as above; an earlier job gave identical numbers, as it should with seeded inputs.
+
+| Operation | Inputs | Max error, true ulps | Budget, model units | Used by the worst element |
+|:---|:---|---:|:---|---:|
+| `tl.exp(x)` | 8.4 million x, uniform in [-80, 0] | 61.4 | 2 + 1.173 \|x\| | 0.502 |
+| `1.0 / x` | 4.2 million x, log-uniform in [2^-20, 2^20] | 0.97 | 2 | 0.409 |
+| `1.0 / tl.sqrt(x)` | 4.2 million x, same range | 2.47 | 4 | 0.314 |
+
+A model unit is 2^-23 relative to the result, which is between 1 and 2 true fp32 ulps. "Used" is the largest error / budget over the elements, each against its own budget.
+
+Every budget holds with about a factor of 2 to spare, so no constant changes.
+
+The exponential by argument size:
+
+| \|x\| in | Max error, true ulps | vs documented bound | Used | Worst x |
+|:---|---:|---:|---:|---:|
+| [0, 1) | 2.18 | 1.091 | 0.478 | -0.246 |
+| [1, 2) | 2.72 | 0.908 | 0.388 | -1.441 |
+| [2, 4) | 3.73 | 0.746 | 0.364 | -3.017 |
+| [4, 8) | 6.62 | 0.777 | 0.401 | -6.230 |
+| [8, 16) | 13.89 | 0.863 | 0.453 | -11.724 |
+| [16, 32) | 28.56 | 0.947 | 0.486 | -22.868 |
+| [32, 64) | 57.81 | 0.995 | 0.502 | -44.757 |
+| [64, 80) | 61.39 | 0.752 | 0.382 | -64.383 |
+
+"vs documented bound" is the largest error in true ulps / (2 + floor(1.173 |x|)), the bound NVIDIA documents for `__expf`. "Worst x" is the argument of the element that uses most of its budget.
+
+1. Triton's exp is not inside the documented `__expf` bound. For |x| below 1 it reaches 2.18 true ulps where the documented figure is 2, and at |x| between 32 and 64 it sits at 0.995 of it. So that documentation cannot be cited as a guarantee for this lowering. The budget still holds because it applies the same two numbers in model units, each of which is up to 2 true ulps. The margin comes from that unit and from this measurement, on one GPU and one Triton version.
+2. The error grows with |x| as the model assumes. In model units the worst elements are at 1.1 near x = 0 and 27.4 at x = -44.8, about 0.6 per unit of |x| at the worst arguments, against the 1.173 the budget allows. The worst arguments sit where x * log2(e) is a little above a power of two (64.6, 33.0, 16.9, 9.0), which is where rounding that product to fp32 costs most relative to |x|. That fits the lowering; the parts were not measured separately.
+3. The first model (4 units plus 0.5 per unit of |x|) was too small in fact, not only against the documentation: at x = -44.757 the measured error is 27.4 units and that model allowed 26.4. At the other rows' worst elements the first model would have held. A softmax output at such an argument is far below the smallest fp16 value, so the kernel checks would probably not have shown this. The probe does.
+
+The probe samples random arguments. It is a measurement, not a proof, and it covers x in [-80, 0] only, which is the range softmax uses.
+
 ### The exp error budget
 
-fp32 `tl.exp` lowers to `ex2.approx.f32` after an fp32 multiply by log2(e) (Triton, `third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/ElementwiseOpToLLVM.cpp`, `ExpOpConversionApprox`). That is the same instruction sequence as CUDA's `__expf`, which the CUDA C++ Programming Guide's Mathematical Functions appendix documents at 2 + floor(|1.173 x|) ulps. The scaled exponent x * log2(e) is rounded, so the error grows with |x|.
+fp32 `tl.exp` lowers to `ex2.approx.f32` after an fp32 multiply by log2(e) (Triton, `third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/ElementwiseOpToLLVM.cpp`, `ExpOpConversionApprox`). CUDA's `__expf` has the same form, and the CUDA C++ Programming Guide's Mathematical Functions appendix documents it at 2 + floor(|1.173 x|) ulps. The scaled exponent x * log2(e) is rounded, so the error grows with |x|. An earlier version of this section called the two "the same instruction sequence"; the measurement above shows Triton's exp slightly outside that documented bound, so the two are not known to be identical.
 
-The first model charged 4 ulps per call plus half an ulp per unit of |argument|. That is above the documented bound for |x| below 3 and below it beyond: 1.2x short at |x| = 6, 1.36x at 10, 1.46x at 20. In a softmax row most arguments x - max sit between -3 and -6, and the fp16 store term uses almost the whole bound (CPU ratios up to 0.998), so a GPU run could have failed on a few elements for a reason that had nothing to do with the kernel. The model now follows the documentation: `EXP_ULPS = 2` fixed per call and `EXP_ARG_ULPS = 1.173` per unit of |argument|, both in `common.py`. The CPU ratios did not move, because the store term dominates there. The GPU run above passed with this model. The earlier model was never run on a GPU, so whether it would have failed is not known.
+The first model charged 4 ulps per call plus half an ulp per unit of |argument|. That is above the documented bound for |x| below 3 and below it beyond: 1.2x short at |x| = 6, 1.36x at 10, 1.46x at 20. In a softmax row most arguments x - max sit between -3 and -6, and the fp16 store term uses almost the whole bound (CPU ratios up to 0.998), so a GPU run could have failed on a few elements for a reason that had nothing to do with the kernel. The model now follows the documentation: `EXP_ULPS = 2` fixed per call and `EXP_ARG_ULPS = 1.173` per unit of |argument|, both in `common.py`. The CPU ratios did not move, because the store term dominates there. The GPU runs passed with this model. The earlier model was never run in a kernel check on a GPU; the probe shows the exp error exceeding it at one large argument (item 3 above).
 
 ## Open items
 
-- The softmax tables are from one run on one library version. Repeat the benchmark before relying on any difference under about 5%, in particular the N = 16384 forward row where eager was 4% ahead.
-- The GPU slack of the softmax bound is not measured. `softmax_checks.py` prints pass or fail; printing the largest error-to-bound ratio per case, as `softmax_cpu_check.py` does, would show how close the exp and division budgets are to their limit.
-- The softmax and LayerNorm benchmarks come from different torch and triton versions (Kaggle and Colab). No softmax number has been compared with a LayerNorm number across them.
+- The approximate-math budgets rest on a measurement on one GPU model and one Triton version, not on a documented guarantee: Triton's exp is slightly outside NVIDIA's documented `__expf` bound. `kaggle_run.py run` runs `probe_math.py` before the checks, so a new Triton version or GPU that uses more of a budget shows up there first. Run it before trusting the bounds anywhere else.
+- The LayerNorm tables on the Kaggle versions are from one run. On those versions the forward and the split backward are 6% and 11% slower at N = 32768 than on Colab, and `probe_spills.py` has not been run there to say why.
+- Whether the LayerNorm forward beats `torch.compile` at N = 16384 and 32768 depends on the torch version: it did on torch 2.14.1 and does not on torch 2.11.0. Only the newer result has been repeated.
 - At N = 32768 the dx kernel keeps 26 spill instructions at 8 warps and runs at 207 GB/s against 247 GB/s at N = 16384. Accepted: the measured alternative was slower, and 32768 is the top of the fp16 single-block range.
 - All numbers are from one GPU model. The switch point and the warp cap are T4 measurements; rerun `probe_spills.py` and both benchmarks before trusting them on another GPU.

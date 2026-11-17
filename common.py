@@ -33,9 +33,12 @@ HALF_MIN_SUBNORMAL = {torch.float16: 2.0**-25, torch.bfloat16: 2.0**-134}
 APPROX_MATH_ULPS = 4  # tl.sqrt followed by an fp32 division, combined (LayerNorm's rstd)
 DIV_ULPS = 2  # one fp32 division: div.full.f32, documented at 2 ulps
 # fp32 tl.exp lowers to ex2.approx(x * log2e) on NVIDIA (Triton ElementwiseOpToLLVM.cpp).
-# CUDA documents that same sequence as __expf: max error 2 + floor(|1.173 x|) ulps (CUDA
+# CUDA documents __expf, which has the same form, at 2 + floor(|1.173 x|) true ulps (CUDA
 # C++ Programming Guide, Mathematical Functions appendix, intrinsic table). The argument
 # term exists because the scaled exponent x * log2e is rounded, so the error grows with |x|.
+# The budget applies those two numbers in this model's unit, 2**-23 relative to the result,
+# which is 1 to 2 true ulps. That matters: probe_math.py measured Triton's exp on a T4 at up
+# to 1.09 times the documented figure in true ulps, and at 0.50 of this budget (RESULTS.md).
 EXP_ULPS = 2  # fixed part per tl.exp call
 EXP_ARG_ULPS = 1.173  # per unit of |argument|, per tl.exp call
 

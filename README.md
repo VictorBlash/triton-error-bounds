@@ -6,19 +6,19 @@ Measured on a Tesla T4 (Google Colab), M = 4096 rows, fp16, against eager `F.lay
 
 | | vs eager PyTorch | vs torch.compile | Bandwidth |
 |:---|:---|:---|:---|
-| Forward | 1.3–1.45x at N ≥ 4096 | a wash: 0.93–1.05x up to N = 8192, 1.1–1.3x at 16384–32768 | about 230 GB/s, 72% of the T4's 320 GB/s peak |
-| Backward | 1.3–2.0x from N = 1024 | 1.35–1.8x at N = 1024 and N ≥ 4096; tie at 512, 0.96x at 2048 | up to 200 GB/s |
+| Forward | 1.3–1.45x at N ≥ 4096 | a wash: 0.93–1.05x up to N = 8192; 1.1–1.3x at 16384–32768 on torch 2.14.1 but 0.97–0.98x on torch 2.11.0 | about 230 GB/s, 72% of the T4's 320 GB/s peak |
+| Backward | 1.3–2.0x from N = 1024 | 1.35–1.8x at N = 1024 and N ≥ 4096 (1.2x at 32768 on the older versions); tie at 512 and 2048 | up to 200 GB/s |
 
 The eager comparison flatters the forward: inductor's generated forward kernel matches or beats this one at common hidden sizes. The backward is where the custom kernel earns its place. Full tables, the register-spill investigation, a retracted measurement and the reasons behind every tuning constant are in [RESULTS.md](RESULTS.md).
 
-The repo also has a softmax built on the same error model, with an online forward and a tiled backward for rows too wide for one block. Measured on a Tesla T4 (Kaggle, older torch and triton than the Colab runs), same M and dtype, one run:
+The repo also has a softmax built on the same error model, with an online forward and a tiled backward for rows too wide for one block. Measured on a Tesla T4 (Kaggle, older torch and triton than the Colab runs), same M and dtype, two runs that agree:
 
 | | vs eager PyTorch | vs torch.compile | Bandwidth |
 |:---|:---|:---|:---|
-| Forward | 1.1–1.4x, except 0.96x at N = 16384 | a tie: 0.98–1.09x, except 1.33x at N = 32768 | about 230 GB/s up to N = 32768 |
+| Forward | 1.1–1.4x, except 0.96x at N = 16384 | a tie up to N = 8192 (0.96–1.03x); 1.1x at 16384, 1.34x at 32768 | about 230 GB/s up to N = 32768 |
 | Backward | 1.9–2.1x up to N = 32768, 1.4x at 65536 | a tie: 0.97–1.01x, except 1.22x at N = 32768 | 220–240 GB/s up to N = 32768 |
 
-Softmax is not a speed win over inductor. It is here because its error model has to budget for the GPU's approximate exp and division, and the GPU run is the only test of that budget: every element of every case stayed inside its bound.
+Softmax is not a speed win over inductor. It is here because its error model has to budget for the GPU's approximate exp and division, and the GPU run is the only test of that budget: every element of every case stayed inside its bound. `probe_math.py` then measures the budgets directly: on the T4 the worst exp, division and 1 / sqrt results use 0.50, 0.41 and 0.31 of what the model allows. It also shows Triton's exp slightly outside the bound NVIDIA documents for `__expf`, so the budget rests on that measurement and not on the documentation.
 
 ## What is different here
 
@@ -84,6 +84,7 @@ y = layer_norm_autograd(x, weight, bias)   # x: fp16 or bf16 CUDA tensor of shap
 - fp16 and bf16 inputs only, with fp32 statistics. No fp32 input path.
 - LayerNorm rows must fit one block: N ≤ 32768 for fp16 and bf16. Softmax has no such limit, but above it uses the slower two-pass paths.
 - Tuning constants (the layout switch at N = 16384, the 8-warp cap on the dx kernel, the softmax block limit and tile width) are T4 measurements. Rerun the probe and benchmarks before trusting them on another GPU.
-- The softmax numbers are from one run, on older torch and triton versions than the LayerNorm numbers.
+- The Colab and Kaggle numbers come from different torch and triton versions. RESULTS.md has LayerNorm on both; the two disagree on whether the forward beats `torch.compile` at N ≥ 16384.
+- The approximate-math budgets were measured on one GPU model and one Triton version. Run `probe_math.py` before trusting the bounds on another.
 - The autograd wrappers are tested in isolation, not inside a training loop.
 - The LayerNorm bound assumes no fp32 overflow or underflow. Both bounds assume approximate sqrt, division and exp stay within stated ulp budgets; the constants are in `common.py`.
