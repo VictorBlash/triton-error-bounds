@@ -174,8 +174,24 @@ def assert_close(name: str, got: torch.Tensor, want: torch.Tensor, atol: float, 
     )
 
 
-def assert_within_bound(name: str, got: torch.Tensor, ref: torch.Tensor, bound: torch.Tensor) -> None:
-    """Assert |got - ref| <= bound elementwise; the message names the worst element."""
+def bound_ratio(got: torch.Tensor, ref: torch.Tensor, bound: torch.Tensor) -> float:
+    """Largest |got - ref| / bound over all elements: how much of the bound the worst element uses.
+
+    At most 1 is inside the bound. An exact element counts as 0 even where its bound is
+    zero. A NaN, or any error over a zero bound, counts as infinity so it cannot read as a pass.
+    """
+    err = (got.double() - ref).abs()
+    ratio = torch.where(err == 0, torch.zeros_like(err), err / bound)
+    inf = float("inf")
+    return float(torch.nan_to_num(ratio, nan=inf, posinf=inf).max())
+
+
+def assert_within_bound(name: str, got: torch.Tensor, ref: torch.Tensor, bound: torch.Tensor) -> float:
+    """Assert |got - ref| <= bound elementwise; the message names the worst element.
+
+    Returns:
+        bound_ratio of the result, so a passing check can also report its slack.
+    """
     excess = (got.double() - ref).abs() - bound
     worst = int(excess.argmax())
     assert (excess <= 0).all(), (
@@ -183,3 +199,4 @@ def assert_within_bound(name: str, got: torch.Tensor, ref: torch.Tensor, bound: 
         f"got={got.flatten()[worst].item():.6g}, ref={ref.flatten()[worst].item():.6g}, "
         f"bound={bound.flatten()[worst].item():.3e}"
     )
+    return bound_ratio(got, ref, bound)

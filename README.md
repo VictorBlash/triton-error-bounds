@@ -40,6 +40,7 @@ LayerNorm kernels are a Triton tutorial. The verification is the point of this r
 | `probe_spills.py` | Registers, spills, time and bandwidth per kernel, with a warp sweep |
 | `softmax_triton.py` | Softmax forward (block and online) and backward (block and tiled) kernels, launchers, autograd wrapper |
 | `softmax_checks.py` | Softmax error bound, checks, mutation tests, benchmark |
+| `probe_math.py` | The GPU's fp32 exp, division and 1 / sqrt error in ulps, against the budgets the bounds assume |
 | `softmax_cpu_check.py` | The softmax error bound against an fp32 emulation of the kernels; runs without a GPU or Triton |
 | `kaggle_run.py` | Runs the checks or benchmarks on a Kaggle T4 from the command line and returns the result |
 | `RESULTS.md` | Measurements and decisions |
@@ -56,13 +57,14 @@ python layernorm_triton.py                    # checks plus forward benchmark
 python layernorm_bwd_checks.py                # checks plus backward benchmark
 python softmax_checks.py                      # checks plus both softmax benchmarks
 python probe_spills.py --n 16384 32768        # registers and spills per kernel
+python probe_math.py                          # exp, division and 1/sqrt error against the budgets
 python softmax_cpu_check.py                   # error-model check, no GPU needed
 ```
 
 Without a local GPU, `kaggle_run.py` does the upload and the run. It needs the [Kaggle CLI](https://github.com/Kaggle/kaggle-cli) (`uv tool install kaggle --with six`, then `kaggle auth login`) and the kernel owner in `KERNEL_ID` at the top of the script set to your Kaggle username.
 
 ```
-python kaggle_run.py run            # every check on a Kaggle T4, a few minutes
+python kaggle_run.py run            # math probe and every check on a Kaggle T4, a few minutes
 python kaggle_run.py run --bench    # checks plus every benchmark
 ```
 

@@ -13,6 +13,10 @@ kernels:
     mean, where the true dx is near zero and the mutant's is not.
 The bound must reject both; the output reports whether allclose also caught them.
 
+Each case also prints the largest |error| / bound per path. Rounding the result to fp16
+or bf16 makes up almost all of the bound, so on correct kernels that ratio sits close to
+1 and says little about the fp32 budgets. probe_math.py measures those directly.
+
 Error model: common.py, with exp_err for the exponential. The online forward's
 denominator terms pass through up to one rescale per later tile plus the lane merge, so
 that bound takes the tile count; the numerator is always a single exp.
@@ -224,11 +228,16 @@ def _row_indices(m: int) -> list[int]:
     return sorted({0, m // 2, m - 1})
 
 
-def check_forward(x: torch.Tensor) -> dict[str, torch.Tensor]:
+def _format_ratios(ratios: dict[str, float]) -> str:
+    """Render {path: ratio} as "block 0.912, online 0.913"."""
+    return ", ".join(f"{path} {ratio:.3f}" for path, ratio in ratios.items())
+
+
+def check_forward(x: torch.Tensor) -> tuple[dict[str, torch.Tensor], dict[str, float]]:
     """Run every forward check for one input on every path that takes its width.
 
     Returns:
-        {path: y} for the paths that ran.
+        ({path: y}, {path: largest |y - fp64| / bound}) for the paths that ran.
 
     Raises:
         AssertionError: any check fails. The message names the path and the check.
@@ -238,7 +247,7 @@ def check_forward(x: torch.Tensor) -> dict[str, torch.Tensor]:
     m = rows.shape[0]
     y_eager = softmax_eager(x)
     atol, rtol = parity_tolerances(x.dtype)
-    got = {}
+    got, ratios = {}, {}
     for path in FWD_PATHS:
         if path == "block" and not fits_block(n):
             continue
@@ -246,17 +255,17 @@ def check_forward(x: torch.Tensor) -> dict[str, torch.Tensor]:
         assert torch.isfinite(y).all(), f"{path}: non-finite output"
         assert_close(f"{path} y vs eager", y, y_eager, atol, rtol)
         y_ref, bound = softmax_reference_with_bound(x, 0 if path == "block" else online_tiles(n))
-        assert_within_bound(f"{path} y vs fp64", y, y_ref, bound)
+        ratios[path] = assert_within_bound(f"{path} y vs fp64", y, y_ref, bound)
         assert torch.equal(y, softmax_triton(x, path=path)), f"{path}: two launches differ"
         y_rows = y.reshape(-1, n)
         for i in _row_indices(m):
             single = softmax_triton(rows[i : i + 1], path=path)
             assert torch.equal(single, y_rows[i : i + 1]), f"{path}: row {i} differs when launched alone"
         got[path] = y
-    return got
+    return got, ratios
 
 
-def check_backward(x: torch.Tensor, y: torch.Tensor) -> dict[str, torch.Tensor]:
+def check_backward(x: torch.Tensor, y: torch.Tensor) -> tuple[dict[str, torch.Tensor], dict[str, float]]:
     """Run every backward check for one input on every path that takes its width.
 
     Args:
@@ -264,7 +273,7 @@ def check_backward(x: torch.Tensor, y: torch.Tensor) -> dict[str, torch.Tensor]:
         y: the default forward path's output, what the autograd wrapper saves.
 
     Returns:
-        {path: dx} for the paths that ran.
+        ({path: dx}, {path: largest |dx - fp64| / bound}) for the paths that ran.
 
     Raises:
         AssertionError: any check fails. The message names the path and the check.
@@ -280,7 +289,7 @@ def check_backward(x: torch.Tensor, y: torch.Tensor) -> dict[str, torch.Tensor]:
     dx_ref, bound = softmax_bwd_reference_with_bound(dy, y)
     atol, rtol = parity_tolerances(x.dtype)
 
-    got = {}
+    got, ratios = {}, {}
     y_rows, dy_rows = y.reshape(-1, n), dy.reshape(-1, n)
     for path in BWD_PATHS:
         if path == "block" and not fits_block(n):
@@ -288,7 +297,7 @@ def check_backward(x: torch.Tensor, y: torch.Tensor) -> dict[str, torch.Tensor]:
         dx = softmax_triton_bwd(dy, y, path=path)
         assert torch.isfinite(dx).all(), f"{path}: non-finite dx"
         assert_close(f"{path} dx vs eager", dx, dx_eager, atol, rtol)
-        assert_within_bound(f"{path} dx vs fp64", dx, dx_ref, bound)
+        ratios[path] = assert_within_bound(f"{path} dx vs fp64", dx, dx_ref, bound)
         assert torch.equal(dx, softmax_triton_bwd(dy, y, path=path)), f"{path}: two launches differ"
         dx_rows = dx.reshape(-1, n)
         for i in _row_indices(m):
@@ -302,7 +311,7 @@ def check_backward(x: torch.Tensor, y: torch.Tensor) -> dict[str, torch.Tensor]:
     y_auto.backward(dy)
     assert torch.equal(y_auto, y), "autograd forward differs from the default path"
     assert torch.equal(xa.grad, got[default_bwd_path(n)]), "autograd backward differs from the default path"
-    return got
+    return got, ratios
 
 
 @triton.jit
@@ -490,10 +499,11 @@ def main() -> int:
 
     for shape, dtype, kind, why in CASES:
         x = make_inputs(shape, dtype, device, kind=kind)
-        ys = check_forward(x)
-        dxs = check_backward(x, ys[default_fwd_path(shape[-1])])
+        ys, y_ratios = check_forward(x)
+        dxs, dx_ratios = check_backward(x, ys[default_fwd_path(shape[-1])])
         ran = ", ".join(sorted(set(ys) | set(dxs)))
         print(f"ok  {str(dtype):15} {str(shape):14} {why} ({ran})")
+        print(f"      largest |error| / bound   y: {_format_ratios(y_ratios)}   dx: {_format_ratios(dx_ratios)}")
 
     for label, also in check_bound_rejects_mutants(device).items():
         print(

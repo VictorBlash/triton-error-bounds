@@ -15,7 +15,7 @@ Needs the Kaggle CLI on PATH and a logged-in account:
     uv tool install kaggle --with six
     kaggle auth login
 
-Usage: python kaggle_run.py run                 (checks only, --skip-bench on each script)
+Usage: python kaggle_run.py run                 (math probe and checks, no benchmarks)
        python kaggle_run.py run --bench         (checks plus every benchmark)
        python kaggle_run.py run --cmd "python softmax_checks.py --no-compile"
        python kaggle_run.py build --out DIR     (write the kernel folder, push nothing)
@@ -56,6 +56,8 @@ VERSION_PROBE = [
     '"|", torch.cuda.get_device_name(0), "x", torch.cuda.device_count())',
 ]
 CHECK_SCRIPTS = ("layernorm_triton.py", "layernorm_bwd_checks.py", "softmax_checks.py")
+# Runs before the checks: it measures the approximate-math budgets the bounds rely on, in seconds.
+MATH_PROBE = ["python", "probe_math.py"]
 
 POLL_SECONDS = 15
 RUNNING_STATES = {"QUEUED", "RUNNING", "NEW_SCRIPT"}
@@ -157,9 +159,9 @@ def git_state() -> tuple[str, bool]:
 
 
 def default_commands(bench: bool) -> list[list[str]]:
-    """Commands for a standard run: every check script, with benchmarks only if asked."""
+    """Commands for a standard run: the math probe, then every check script, with benchmarks only if asked."""
     extra = [] if bench else ["--skip-bench"]
-    return [["python", script, *extra] for script in CHECK_SCRIPTS]
+    return [MATH_PROBE, *(["python", script, *extra] for script in CHECK_SCRIPTS)]
 
 
 def render_kernel(files: dict[str, bytes], commands: list[list[str]], commit: str, dirty: bool, build_id: str) -> str:

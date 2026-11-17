@@ -46,7 +46,7 @@ try:
 except ImportError:
     _stub_triton()
 
-from common import parity_tolerances  # noqa: E402
+from common import assert_within_bound, bound_ratio, parity_tolerances  # noqa: E402
 from softmax_checks import (  # noqa: E402
     CASES,
     make_inputs,
@@ -101,13 +101,46 @@ def bwd_fp32(dy: torch.Tensor, y: torch.Tensor, drop_sum: bool = False) -> torch
     return (yf * (dyf - s)).to(y.dtype)
 
 
-def ratio(got: torch.Tensor, ref: torch.Tensor, bound: torch.Tensor) -> float:
-    """Largest |got - ref| / bound over all elements."""
-    return float(((got.double() - ref).abs() / bound).max())
+def check_ratio_helpers() -> int:
+    """Check the ratio the GPU checks print: it must be the error measured against the bound.
+
+    The ratio is only worth printing if 0.5 means half the bound is used, an exact result
+    reads 0 even where the bound is zero, and a NaN or an error over a zero bound cannot
+    read as a pass.
+
+    Returns:
+        Number of failed expectations.
+    """
+    ref = torch.tensor([1.0, 2.0, 0.0], dtype=torch.float64)
+    bound = torch.tensor([0.5, 0.5, 0.0], dtype=torch.float64)
+    cases = [
+        ("exact result", ref.clone(), 0.0),
+        ("half the bound used", ref + torch.tensor([0.25, 0.0, 0.0]), 0.5),
+        ("error over a zero bound", ref + torch.tensor([0.0, 0.0, 1e-9]), float("inf")),
+        ("NaN output", ref + torch.tensor([float("nan"), 0.0, 0.0]), float("inf")),
+    ]
+    failures = 0
+    for name, got, want in cases:
+        r = bound_ratio(got, ref, bound)
+        if r != want:
+            print(f"ratio helper: {name}: got {r}, want {want}")
+            failures += 1
+    inside = ref + torch.tensor([0.25, -0.5, 0.0])
+    if assert_within_bound("inside", inside, ref, bound) != 1.0:
+        print("ratio helper: assert_within_bound did not return the ratio of a passing result")
+        failures += 1
+    try:
+        assert_within_bound("outside", ref + torch.tensor([0.75, 0.0, 0.0]), ref, bound)
+    except AssertionError:
+        pass
+    else:
+        print("ratio helper: assert_within_bound accepted an error of 1.5 bounds")
+        failures += 1
+    return failures
 
 
 def main() -> int:
-    failures = 0
+    failures = check_ratio_helpers()
     print(f"{'case':<46} {'block':>7} {'online':>7} {'bwd':>7}  eager-ok")
     for shape, dtype, kind, why in CASES:
         x = make_inputs(shape, dtype, "cpu", kind=kind)
@@ -118,7 +151,7 @@ def main() -> int:
         if fits_block(n):
             y_default = block_fp32(x)
             ref, bound = softmax_reference_with_bound(x, 0)
-            r = ratio(y_default, ref, bound)
+            r = bound_ratio(y_default, ref, bound)
             cells.append(f"{r:7.3f}")
             failures += r >= 1.0
         else:
@@ -126,7 +159,7 @@ def main() -> int:
 
         y = online_fp32(x)
         ref, bound = softmax_reference_with_bound(x, online_tiles(n))
-        r = ratio(y, ref, bound)
+        r = bound_ratio(y, ref, bound)
         cells.append(f"{r:7.3f}")
         failures += r >= 1.0
         if y_default is None:
@@ -135,7 +168,7 @@ def main() -> int:
         g = torch.Generator().manual_seed(7)
         dy = torch.randn(x.shape, generator=g).to(dtype)
         ref, bound = softmax_bwd_reference_with_bound(dy, y_default)
-        r = ratio(bwd_fp32(dy, y_default), ref, bound)
+        r = bound_ratio(bwd_fp32(dy, y_default), ref, bound)
         cells.append(f"{r:7.3f}")
         failures += r >= 1.0
 
@@ -145,8 +178,8 @@ def main() -> int:
 
     x = make_inputs((16, 8192), torch.float16, "cpu", kind="ramp")
     ref, bound = softmax_reference_with_bound(x, online_tiles(8192))
-    good = ratio(online_fp32(x), ref, bound)
-    bad = ratio(online_fp32(x, rescale=False), ref, bound)
+    good = bound_ratio(online_fp32(x), ref, bound)
+    bad = bound_ratio(online_fp32(x, rescale=False), ref, bound)
     verdict = "REJECTED" if bad >= 1.0 else "ACCEPTED (bad)"
     print(f"\nmutant: online without rescale   correct {good:.3f}  mutant {bad:.3g}  {verdict}")
     failures += bad < 1.0
@@ -156,8 +189,8 @@ def main() -> int:
     g = torch.Generator().manual_seed(9)
     dy = (1e-3 * (1.0 + 0.1 * torch.randn(x.shape, generator=g))).half()
     ref, bound = softmax_bwd_reference_with_bound(dy, y)
-    good = ratio(bwd_fp32(dy, y), ref, bound)
-    bad = ratio(bwd_fp32(dy, y, drop_sum=True), ref, bound)
+    good = bound_ratio(bwd_fp32(dy, y), ref, bound)
+    bad = bound_ratio(bwd_fp32(dy, y, drop_sum=True), ref, bound)
     xg = x.float().requires_grad_(True)
     F.softmax(xg, dim=-1).backward(dy.float())
     atol, rtol = parity_tolerances(torch.float16)
