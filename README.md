@@ -11,6 +11,15 @@ Measured on a Tesla T4 (Google Colab), M = 4096 rows, fp16, against eager `F.lay
 
 The eager comparison flatters the forward: inductor's generated forward kernel matches or beats this one at common hidden sizes. The backward is where the custom kernel earns its place. Full tables, the register-spill investigation, a retracted measurement and the reasons behind every tuning constant are in [RESULTS.md](RESULTS.md).
 
+The repo also has a softmax built on the same error model, with an online forward and a tiled backward for rows too wide for one block. Measured on a Tesla T4 (Kaggle, older torch and triton than the Colab runs), same M and dtype, one run:
+
+| | vs eager PyTorch | vs torch.compile | Bandwidth |
+|:---|:---|:---|:---|
+| Forward | 1.1–1.4x, except 0.96x at N = 16384 | a tie: 0.98–1.09x, except 1.33x at N = 32768 | about 230 GB/s up to N = 32768 |
+| Backward | 1.9–2.1x up to N = 32768, 1.4x at 65536 | a tie: 0.97–1.01x, except 1.22x at N = 32768 | 220–240 GB/s up to N = 32768 |
+
+Softmax is not a speed win over inductor. It is here because its error model has to budget for the GPU's approximate exp and division, and the GPU run is the only test of that budget: every element of every case stayed inside its bound.
+
 ## What is different here
 
 LayerNorm kernels are a Triton tutorial. The verification is the point of this repo.
@@ -24,22 +33,29 @@ LayerNorm kernels are a Triton tutorial. The verification is the point of this r
 
 | File | Contents |
 |:---|:---|
-| `layernorm_triton.py` | Forward kernel, launcher, the rounding-error model, forward checks and benchmark |
+| `common.py` | Shared by every script: the rounding-error primitives and ulp budgets, tolerances, assertion and benchmark helpers |
+| `layernorm_triton.py` | Forward kernel, launcher, the LayerNorm error bound, forward checks and benchmark |
 | `layernorm_triton_bwd.py` | Backward kernels (fused and split paths), launchers, `torch.autograd.Function` wrapper |
 | `layernorm_bwd_checks.py` | Backward checks, mutation tests, benchmark |
 | `probe_spills.py` | Registers, spills, time and bandwidth per kernel, with a warp sweep |
+| `softmax_triton.py` | Softmax forward (block and online) and backward (block and tiled) kernels, launchers, autograd wrapper |
+| `softmax_checks.py` | Softmax error bound, checks, mutation tests, benchmark |
+| `softmax_cpu_check.py` | The softmax error bound against an fp32 emulation of the kernels; runs without a GPU or Triton |
 | `RESULTS.md` | Measurements and decisions |
 
 ## Running
 
-Needs a CUDA GPU with PyTorch and Triton. The results here were produced on a free Colab T4 (Runtime → Change runtime type → T4 GPU) with the four `.py` files uploaded through the Files panel.
+Needs a CUDA GPU with PyTorch and Triton. The LayerNorm results were produced on a free Colab T4 and the softmax results on a free Kaggle T4. Upload every `.py` file: all the scripts import `common.py`.
 
 ```
 python layernorm_triton.py --skip-bench       # forward checks, about a minute
 python layernorm_bwd_checks.py --skip-bench   # backward checks on both paths
+python softmax_checks.py --skip-bench         # softmax checks on every path
 python layernorm_triton.py                    # checks plus forward benchmark
 python layernorm_bwd_checks.py                # checks plus backward benchmark
+python softmax_checks.py                      # checks plus both softmax benchmarks
 python probe_spills.py --n 16384 32768        # registers and spills per kernel
+python softmax_cpu_check.py                   # error-model check, no GPU needed
 ```
 
 Every check prints an `ok` line; a failure raises with the check name and, for the bound, the worst element. The benchmarks include eager PyTorch and `torch.compile` columns; `--no-compile` leaves the compiled one out.
@@ -54,7 +70,8 @@ y = layer_norm_autograd(x, weight, bias)   # x: fp16 or bf16 CUDA tensor of shap
 ## Limits
 
 - fp16 and bf16 inputs only, with fp32 statistics. No fp32 input path.
-- Each row must fit one block: N ≤ 32768 for fp16 and bf16.
-- Tuning constants (the layout switch at N = 16384, the 8-warp cap on the dx kernel) are T4 measurements. Rerun the probe and benchmarks before trusting them on another GPU.
-- The autograd wrapper is tested in isolation, not inside a training loop.
-- The error bound assumes no fp32 overflow or underflow and that approximate sqrt and division stay within a stated ulp budget; the constants are at the top of `layernorm_triton.py`.
+- LayerNorm rows must fit one block: N ≤ 32768 for fp16 and bf16. Softmax has no such limit, but above it uses the slower two-pass paths.
+- Tuning constants (the layout switch at N = 16384, the 8-warp cap on the dx kernel, the softmax block limit and tile width) are T4 measurements. Rerun the probe and benchmarks before trusting them on another GPU.
+- The softmax numbers are from one run, on older torch and triton versions than the LayerNorm numbers.
+- The autograd wrappers are tested in isolation, not inside a training loop.
+- The LayerNorm bound assumes no fp32 overflow or underflow. Both bounds assume approximate sqrt, division and exp stay within stated ulp budgets; the constants are in `common.py`.
