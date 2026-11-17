@@ -18,6 +18,8 @@ Needs the Kaggle CLI on PATH and a logged-in account:
 Usage: python kaggle_run.py run                 (math probe and checks, no benchmarks)
        python kaggle_run.py run --bench         (checks plus every benchmark)
        python kaggle_run.py run --cmd "python softmax_checks.py --no-compile"
+       python kaggle_run.py run --internet --cmd "python -m pip install -q --target /tmp/t triton==3.8.0" \
+           --cmd "PYTHONPATH=/tmp/t python probe_spills.py"      (same GPU, another Triton version)
        python kaggle_run.py build --out DIR     (write the kernel folder, push nothing)
        python kaggle_run.py status | logs | fetch
 """
@@ -70,6 +72,7 @@ KERNEL_TEMPLATE = '''#!/usr/bin/env python3
 import base64
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -77,6 +80,7 @@ import tempfile
 from pathlib import Path
 
 PAYLOAD = json.loads(__PAYLOAD__)
+ENV_ASSIGNMENT = re.compile("[A-Za-z_][A-Za-z0-9_]*=")
 
 
 def main():
@@ -97,10 +101,19 @@ def main():
         for cmd in PAYLOAD["commands"]:
             shown = shlex.join(cmd)
             emit("$ " + shown)
+            cmd_env = dict(env)
+            while cmd and ENV_ASSIGNMENT.match(cmd[0]):
+                name, _, value = cmd[0].partition("=")
+                cmd_env[name] = value
+                cmd = cmd[1:]
+            if not cmd:
+                emit("nothing to run after the environment assignments")
+                failed.append(shown)
+                continue
             argv = [sys.executable if cmd[0] == "python" else cmd[0], *cmd[1:]]
             try:
                 proc = subprocess.Popen(
-                    argv, cwd=src, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+                    argv, cwd=src, env=cmd_env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
                 )
             except OSError as exc:
                 emit("could not start: " + str(exc))
@@ -169,8 +182,10 @@ def render_kernel(files: dict[str, bytes], commands: list[list[str]], commit: st
 
     Args:
         files: {name: contents} of the modules to unpack next to each other.
-        commands: argument lists run in order from the unpacked directory. A leading
-            "python" is replaced by the kernel's own interpreter.
+        commands: argument lists run in order from the unpacked directory. Leading
+            NAME=value items set environment variables for that command, as in a shell.
+            The first item after them, if it is "python", is replaced by the kernel's own
+            interpreter.
         commit: git commit the files came from.
         dirty: True if the working tree differed from that commit.
         build_id: unique id for this build, echoed in the result.
@@ -186,13 +201,14 @@ def render_kernel(files: dict[str, bytes], commands: list[list[str]], commit: st
     return KERNEL_TEMPLATE.replace("__PAYLOAD__", repr(json.dumps(payload)))
 
 
-def write_kernel_dir(out: Path, kernel_id: str, script: str) -> None:
+def write_kernel_dir(out: Path, kernel_id: str, script: str, internet: bool = False) -> None:
     """Write the generated script and the kernel-metadata.json the Kaggle CLI pushes.
 
     Args:
         out: folder to write into; created if missing.
         kernel_id: "owner/slug" of the Kaggle kernel.
         script: source from render_kernel.
+        internet: let the run reach the internet. Off unless a run has to download something.
     """
     out.mkdir(parents=True, exist_ok=True)
     (out / CODE_FILE).write_text(script, encoding="utf-8")
@@ -204,7 +220,7 @@ def write_kernel_dir(out: Path, kernel_id: str, script: str) -> None:
         "kernel_type": "script",
         "is_private": True,
         "enable_gpu": True,
-        "enable_internet": False,
+        "enable_internet": internet,
         "machine_shape": ACCELERATOR,
         "dataset_sources": [],
         "competition_sources": [],
@@ -214,12 +230,12 @@ def write_kernel_dir(out: Path, kernel_id: str, script: str) -> None:
     (out / "kernel-metadata.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
 
 
-def build(out: Path, kernel_id: str, commands: list[list[str]]) -> str:
+def build(out: Path, kernel_id: str, commands: list[list[str]], internet: bool = False) -> str:
     """Write a kernel folder for the current tree and return its build id."""
     commit, dirty = git_state()
     build_id = f"{time.strftime('%Y%m%dT%H%M%S')}-{uuid.uuid4().hex[:8]}"
     script = render_kernel(repo_sources(), [VERSION_PROBE, *commands], commit, dirty, build_id)
-    write_kernel_dir(out, kernel_id, script)
+    write_kernel_dir(out, kernel_id, script, internet)
     print(f"built {build_id} from commit {commit}{' + uncommitted changes' if dirty else ''} in {out}")
     return build_id
 
@@ -308,6 +324,7 @@ def main() -> int:
     parser.add_argument("--kernel", default=KERNEL_ID, help="Kaggle kernel as owner/slug")
     parser.add_argument("--bench", action="store_true", help="run the benchmarks too, not only the checks")
     parser.add_argument("--cmd", action="append", help="command to run instead of the standard set; repeatable")
+    parser.add_argument("--internet", action="store_true", help="let the run download, e.g. another Triton version")
     parser.add_argument("--out", type=Path, help="build: folder to write the kernel into")
     parser.add_argument("--timeout", type=int, default=3600, help="run: Kaggle-side limit in seconds")
     parser.add_argument("--wait-minutes", type=float, default=45, help="run: how long to wait for the result")
@@ -326,11 +343,11 @@ def main() -> int:
         elif args.action == "build":
             if args.out is None:
                 parser.error("build needs --out DIR")
-            build(args.out, args.kernel, commands)
+            build(args.out, args.kernel, commands, args.internet)
             return 0
         else:
             with tempfile.TemporaryDirectory(prefix="kaggle_kernel_") as tmp:
-                build_id = build(Path(tmp), args.kernel, commands)
+                build_id = build(Path(tmp), args.kernel, commands, args.internet)
                 print(kaggle("kernels", "push", "-p", tmp, "--accelerator", ACCELERATOR, "-t", str(args.timeout)))
             text = wait_for_result(args.kernel, build_id, args.wait_minutes)
     except KaggleError as exc:
