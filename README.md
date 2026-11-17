@@ -7,7 +7,7 @@ Measured on a Tesla T4 (Google Colab), M = 4096 rows, fp16, against eager `F.lay
 | | vs eager PyTorch | vs torch.compile | Bandwidth |
 |:---|:---|:---|:---|
 | Forward | 1.3–1.45x at N ≥ 4096 | a wash: 0.93–1.05x up to N = 8192; 1.1–1.3x at 16384–32768 on torch 2.14.1 but 0.97–0.98x on torch 2.11.0 | about 230 GB/s, 72% of the T4's 320 GB/s peak |
-| Backward | 1.3–2.0x from N = 1024 | 1.35–1.8x at N = 1024 and N ≥ 4096 (1.2x at 32768 on the older versions); tie at 512 and 2048 | up to 200 GB/s |
+| Backward | 1.3–2.0x from N = 1024 | 1.35–1.8x at N = 1024 and N ≥ 4096 (1.2x at 32768 on Triton 3.6.0); tie at 512 and 2048 | up to 200 GB/s |
 
 The eager comparison flatters the forward: inductor's generated forward kernel matches or beats this one at common hidden sizes. The backward is where the custom kernel earns its place. Full tables, the register-spill investigation, a retracted measurement and the reasons behind every tuning constant are in [RESULTS.md](RESULTS.md).
 
@@ -85,6 +85,7 @@ y = layer_norm_autograd(x, weight, bias)   # x: fp16 or bf16 CUDA tensor of shap
 - LayerNorm rows must fit one block: N ≤ 32768 for fp16 and bf16. Softmax has no such limit, but above it uses the slower two-pass paths.
 - Tuning constants (the layout switch at N = 16384, the 8-warp cap on the dx kernel, the softmax block limit and tile width) are T4 measurements. Rerun the probe and benchmarks before trusting them on another GPU.
 - The Colab and Kaggle numbers come from different torch and triton versions. RESULTS.md has LayerNorm on both; the two disagree on whether the forward beats `torch.compile` at N ≥ 16384.
+- The backward numbers at N = 32768 assume Triton 3.8.0 or later. On 3.6.0 and 3.7.1 Triton generates code that spills more registers there, and the backward is 9 to 12% slower at that width only. Measured on one GPU with only Triton changed; see RESULTS.md.
 - The approximate-math budgets were measured on one GPU model and one Triton version. Run `probe_math.py` before trusting the bounds on another.
 - The autograd wrappers are tested in isolation, not inside a training loop.
 - The LayerNorm bound assumes no fp32 overflow or underflow. Both bounds assume approximate sqrt, division and exp stay within stated ulp budgets; the constants are in `common.py`.

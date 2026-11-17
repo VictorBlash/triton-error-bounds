@@ -181,7 +181,33 @@ Against the Colab run 5 tables:
 
 - The forward no longer beats `torch.compile` at any width: 0.95x to 1.01x. On Colab it won at N = 16384 and 32768 (1.11x and 1.27x). The difference is inductor, not this kernel. Inductor's forward on torch 2.11.0 takes 1.12 ms at 16384 and 2.46 ms at 32768, against 1.26 and 3.01 ms on torch 2.14.1, and it holds 219 to 240 GB/s where the newer version dropped to 214 and 178. So the forward's only wins over inductor depend on the torch version.
 - The backward conclusion holds: 1.37x to 1.76x over inductor at N = 1024, 4096, 8192 and 16384, a tie at 512 and 2048, and 1.20x at 32768 (1.35x on Colab).
-- The Triton kernels themselves are within 3% of Colab up to N = 16384, apart from the forward at 512 (4.5% slower). At N = 32768 both are slower on triton 3.6.0: the forward by 6% (214 against 227 GB/s) and the split backward by 11% (6.58 against 5.94 ms). `probe_spills.py` was not run on this version, so the cause is not known.
+- The Triton kernels themselves are within 3% of Colab up to N = 16384, apart from the forward at 512 (4.5% slower). At N = 32768 the split backward is 11% slower (6.58 against 5.94 ms) and the forward reads 6% slower (214 against 227 GB/s). The next section finds the cause of the first and shows the second is noise.
+
+### Triton version and the N = 32768 backward
+
+Question: is the slower N = 32768 backward caused by the GPU, by torch, or by Triton? Method: `probe_spills.py` on one Kaggle T4, in one session, with torch 2.11.0 throughout and only Triton changed. Each other version was installed into a side folder and put first on the path for that one command (`kaggle_run.py run --internet`). Every probe prints the version it imported. Tree at commit `a96b524`.
+
+The dx kernel at N = 32768, registers per thread / spill instructions, then ms:
+
+| Triton | 8 warps (launcher) | 16 warps | 32 warps | dx + dw/db |
+|:---|:---|:---|:---|---:|
+| 3.6.0 (Kaggle's) | 255 / 46, 4.44 | 128 / 24, 4.42 | 64 / 18, 5.08 | 6.52 |
+| 3.7.1 | 255 / 48, 4.57 | 128 / 24, 4.36 | 64 / 24, 5.90 | 6.64 |
+| 3.8.0 (Colab's) | 255 / 26, 3.85 | 128 / 20, 4.25 | 64 / 12, 4.48 | 5.92 |
+| 3.9.0 | 255 / 26, 3.93 | 128 / 18, 4.13 | 64 / 16, 4.77 | 6.01 |
+
+"dx + dw/db" adds the dw/db kernel, which takes 2.07 ms with 62 registers and no spills on every version. It predicts the split path: the benchmarks measured 6.58 ms on 3.6.0 and 5.94 ms on 3.8.0.
+
+1. The cause is the Triton version. Up to 3.7.1 the dx kernel has 46 to 48 spill instructions at the launcher's 8 warps and takes 4.44 to 4.57 ms; from 3.8.0 it has 26 and takes 3.85 to 3.93 ms. That is 13 to 19% on the dx kernel and 9 to 12% on the split backward, at N = 32768 only.
+2. It is not the GPU. With Triton 3.8.0 the Kaggle T4 reproduces the Colab probe table above: registers and spills are identical in all 12 kernel rows and every time is within 1.2%.
+3. It is not noise. Triton 3.6.0 was probed six times in three sessions: 4.42 to 4.48 ms, with the same register and spill counts every time.
+4. It is Triton's generated code, not NVIDIA's assembler. Triton 3.6.0 bundles ptxas 12.8.93 and 3.8.0 bundles 12.9.86. With `TRITON_PTXAS_PATH` pointing Triton 3.8.0 at the older ptxas, the dx kernel still has 26 spills and takes 3.90 ms; the forward's register count moved from 233 to 229, which shows the override took effect. Pointing Triton 3.6.0 at the newer ptxas left it at 46 spills and 4.46 ms. So the PTX that Triton hands to the assembler differs. Which change between 3.7.1 and 3.8.0 is responsible was not identified; the release notes list LLVM updates in that window.
+5. Below the spill threshold the versions differ in registers but not in time. At N = 16384 the dx kernel at 8 warps needs 218 registers on 3.6.0, 202 on 3.7.1 and 162 on 3.8.0 and 3.9.0, with no spills and 1.63 to 1.65 ms on all four.
+6. The 8-warp cap stays. It is the fastest setting on 3.8.0 and 3.9.0, ties 16 warps on 3.6.0 (4.44 against 4.42 ms), and loses to 16 warps by about 5% on 3.7.1.
+
+The forward at N = 32768 is a different story. It has no spills on any version (255 registers on 3.6.0 and 3.7.1, 233 on 3.8.0, 239 on 3.9.0), and its time does not follow the version: six samples on 3.6.0 span 2.51 to 2.64 ms, two on 3.8.0 are 2.50 and 2.51 ms, 3.7.1 gave 2.49 and 3.9.0 gave 2.47. In the one session that ran 3.6.0 and 3.8.0 twice each (once with each assembler), they measured 2.51 and 2.52 against 2.51 and 2.50. So no version effect is shown for the forward. The 6% above compares two benchmark figures, and the Colab one (2.37 ms) is lower than every probe sample on either machine, including Colab's own probe (2.48 ms). Treat the forward's N = 32768 row as good to about 5%.
+
+Not on the default path, but large: the fused backward at N = 32768 takes 64.7 ms on 3.6.0, 50.0 on 3.8.0 and 39.1 on 3.9.0, and the dx kernel at 4 warps takes 38.0 ms on 3.6.0 and 16.6 on 3.8.0. Heavily spilling kernels are the most sensitive to the Triton version.
 
 ## Softmax
 
@@ -297,7 +323,8 @@ The first model charged 4 ulps per call plus half an ulp per unit of |argument|.
 ## Open items
 
 - The approximate-math budgets rest on a measurement on one GPU model and one Triton version, not on a documented guarantee: Triton's exp is slightly outside NVIDIA's documented `__expf` bound. `kaggle_run.py run` runs `probe_math.py` before the checks, so a new Triton version or GPU that uses more of a budget shows up there first. Run it before trusting the bounds anywhere else.
-- The LayerNorm tables on the Kaggle versions are from one run. On those versions the forward and the split backward are 6% and 11% slower at N = 32768 than on Colab, and `probe_spills.py` has not been run there to say why.
+- The backward numbers at N = 32768 assume Triton 3.8.0 or later. On 3.6.0 and 3.7.1 the dx kernel spills more and the split backward is 9 to 12% slower there. The Triton change responsible, somewhere between 3.7.1 and 3.8.0 in the code it generates, was not identified.
+- The LayerNorm benchmark tables on the Kaggle versions are from one run. The forward at N = 32768 varies by about 5% between samples on one GPU.
 - Whether the LayerNorm forward beats `torch.compile` at N = 16384 and 32768 depends on the torch version: it did on torch 2.14.1 and does not on torch 2.11.0. Only the newer result has been repeated.
 - At N = 32768 the dx kernel keeps 26 spill instructions at 8 warps and runs at 207 GB/s against 247 GB/s at N = 16384. Accepted: the measured alternative was slower, and 32768 is the top of the fp16 single-block range.
 - All numbers are from one GPU model. The switch point and the warp cap are T4 measurements; rerun `probe_spills.py` and both benchmarks before trusting them on another GPU.
