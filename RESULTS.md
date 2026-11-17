@@ -350,5 +350,5 @@ Limits of the verdict: one head dimension, non-causal, six hand-picked settings 
 - The LayerNorm benchmark tables on the Kaggle versions are from one run. The forward at N = 32768 varies by about 5% between samples on one GPU.
 - Whether the LayerNorm forward beats `torch.compile` at N = 16384 and 32768 depends on the torch version: it did on torch 2.14.1 and does not on torch 2.11.0. Only the newer result has been repeated.
 - At N = 32768 the dx kernel keeps 26 spill instructions at 8 warps and runs at 207 GB/s against 247 GB/s at N = 16384. Accepted: the measured alternative was slower, and 32768 is the top of the fp16 single-block range.
-- The attention verdict is for the T4 only. On compute capability 8.0 or higher, rerun `probe_attention.py` before deciding anything.
+- The attention verdict is for the T4 only. On compute capability 8.0 or higher, rerun `probe_attention.py` before deciding anything. Kaggle would not provide such a GPU on this account (2026-11-16): asked for `NvidiaL4X1` it ran two T4s, and asked for `NvidiaL4` it ran a session with no GPU, both without an error. `kaggle_run.py` now fails a run whose GPU is not the one requested.
 - All numbers are from one GPU model. The switch point and the warp cap are T4 measurements; rerun `probe_spills.py` and both benchmarks before trusting them on another GPU.

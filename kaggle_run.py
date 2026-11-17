@@ -64,6 +64,11 @@ MATH_PROBE = ["python", "probe_math.py"]
 POLL_SECONDS = 15
 RUNNING_STATES = {"QUEUED", "RUNNING", "NEW_SCRIPT"}
 
+# GPU model each accelerator id should give, as it appears in torch's device name. Kaggle
+# accepts an id the account cannot use and runs something else without saying so: on
+# 2026-11-16 NvidiaL4X1 ran on two T4s and NvidiaL4 ran with no GPU at all.
+EXPECTED_GPU = {"NvidiaTeslaT4": "T4", "NvidiaL4": "L4", "NvidiaL4X1": "L4"}
+
 # The script that runs on Kaggle. It unpacks the embedded modules into a temporary
 # directory, runs each command there, and copies everything the commands print into
 # results.txt. It always exits 0 so Kaggle keeps results.txt; the verdict is the RESULT line.
@@ -201,7 +206,9 @@ def render_kernel(files: dict[str, bytes], commands: list[list[str]], commit: st
     return KERNEL_TEMPLATE.replace("__PAYLOAD__", repr(json.dumps(payload)))
 
 
-def write_kernel_dir(out: Path, kernel_id: str, script: str, internet: bool = False) -> None:
+def write_kernel_dir(
+    out: Path, kernel_id: str, script: str, internet: bool = False, accelerator: str = ACCELERATOR
+) -> None:
     """Write the generated script and the kernel-metadata.json the Kaggle CLI pushes.
 
     Args:
@@ -209,6 +216,8 @@ def write_kernel_dir(out: Path, kernel_id: str, script: str, internet: bool = Fa
         kernel_id: "owner/slug" of the Kaggle kernel.
         script: source from render_kernel.
         internet: let the run reach the internet. Off unless a run has to download something.
+        accelerator: Kaggle accelerator id. Kaggle may run something else if the account
+            cannot use it; the first lines of the result name the GPU that actually ran.
     """
     out.mkdir(parents=True, exist_ok=True)
     (out / CODE_FILE).write_text(script, encoding="utf-8")
@@ -221,7 +230,7 @@ def write_kernel_dir(out: Path, kernel_id: str, script: str, internet: bool = Fa
         "is_private": True,
         "enable_gpu": True,
         "enable_internet": internet,
-        "machine_shape": ACCELERATOR,
+        "machine_shape": accelerator,
         "dataset_sources": [],
         "competition_sources": [],
         "kernel_sources": [],
@@ -230,12 +239,14 @@ def write_kernel_dir(out: Path, kernel_id: str, script: str, internet: bool = Fa
     (out / "kernel-metadata.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
 
 
-def build(out: Path, kernel_id: str, commands: list[list[str]], internet: bool = False) -> str:
+def build(
+    out: Path, kernel_id: str, commands: list[list[str]], internet: bool = False, accelerator: str = ACCELERATOR
+) -> str:
     """Write a kernel folder for the current tree and return its build id."""
     commit, dirty = git_state()
     build_id = f"{time.strftime('%Y%m%dT%H%M%S')}-{uuid.uuid4().hex[:8]}"
     script = render_kernel(repo_sources(), [VERSION_PROBE, *commands], commit, dirty, build_id)
-    write_kernel_dir(out, kernel_id, script, internet)
+    write_kernel_dir(out, kernel_id, script, internet, accelerator)
     print(f"built {build_id} from commit {commit}{' + uncommitted changes' if dirty else ''} in {out}")
     return build_id
 
@@ -312,12 +323,33 @@ def wait_for_result(kernel_id: str, build_id: str, wait_minutes: float) -> str:
     raise KaggleError(f"no result for build {build_id} after {wait_minutes:g} minutes; last status {last or 'unknown'}")
 
 
+def gpu_mismatch(accelerator: str, text: str) -> str | None:
+    """Return a message if the result shows a different GPU than the accelerator asked for.
+
+    Args:
+        accelerator: the Kaggle accelerator id the run requested.
+        text: the result. Its version line ends with "| <device name> x <count>".
+
+    Returns:
+        None if the GPU matches or the id is not in EXPECTED_GPU, else what ran instead.
+    """
+    expected = EXPECTED_GPU.get(accelerator)
+    if expected is None:
+        return None
+    match = re.search(r"^torch .*\| (.+) x \d+$", text, flags=re.MULTILINE)
+    ran = match.group(1) if match else "no GPU (the version line is missing)"
+    if match and expected in ran.split():
+        return None
+    return f"asked Kaggle for {accelerator} ({expected}) but the run used: {ran}"
+
+
 def main() -> int:
     """Parse the command line and run one action.
 
     Returns:
         0 if the result says every command passed (or the action printed what was asked),
-        1 if the result reports a failure, 2 if Kaggle or the run itself could not be used.
+        1 if the result reports a failure or ran on another GPU than the one asked for,
+        2 if Kaggle or the run itself could not be used.
     """
     parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
     parser.add_argument("action", choices=("run", "build", "status", "logs", "fetch"))
@@ -325,6 +357,11 @@ def main() -> int:
     parser.add_argument("--bench", action="store_true", help="run the benchmarks too, not only the checks")
     parser.add_argument("--cmd", action="append", help="command to run instead of the standard set; repeatable")
     parser.add_argument("--internet", action="store_true", help="let the run download, e.g. another Triton version")
+    parser.add_argument(
+        "--accelerator",
+        default=ACCELERATOR,
+        help="Kaggle accelerator id, e.g. NvidiaL4X1; check the GPU named at the top of the result",
+    )
     parser.add_argument("--out", type=Path, help="build: folder to write the kernel into")
     parser.add_argument("--timeout", type=int, default=3600, help="run: Kaggle-side limit in seconds")
     parser.add_argument("--wait-minutes", type=float, default=45, help="run: how long to wait for the result")
@@ -343,18 +380,23 @@ def main() -> int:
         elif args.action == "build":
             if args.out is None:
                 parser.error("build needs --out DIR")
-            build(args.out, args.kernel, commands, args.internet)
+            build(args.out, args.kernel, commands, args.internet, args.accelerator)
             return 0
         else:
             with tempfile.TemporaryDirectory(prefix="kaggle_kernel_") as tmp:
-                build_id = build(Path(tmp), args.kernel, commands, args.internet)
-                print(kaggle("kernels", "push", "-p", tmp, "--accelerator", ACCELERATOR, "-t", str(args.timeout)))
+                build_id = build(Path(tmp), args.kernel, commands, args.internet, args.accelerator)
+                print(kaggle("kernels", "push", "-p", tmp, "--accelerator", args.accelerator, "-t", str(args.timeout)))
             text = wait_for_result(args.kernel, build_id, args.wait_minutes)
     except KaggleError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
     print(text, end="" if text.endswith("\n") else "\n")
+    if args.action == "run":
+        mismatch = gpu_mismatch(args.accelerator, text)
+        if mismatch:
+            print(f"error: {mismatch}", file=sys.stderr)
+            return 1
     return 0 if PASS_LINE in text.splitlines() else 1
 
 
