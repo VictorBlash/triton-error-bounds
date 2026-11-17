@@ -15,7 +15,7 @@ Needs the Kaggle CLI on PATH and a logged-in account:
     uv tool install kaggle --with six
     kaggle auth login
 
-Usage: python kaggle_run.py run                 (math probe and checks, no benchmarks)
+Usage: python kaggle_run.py run                 (math probe, checks and training-loop check, no benchmarks)
        python kaggle_run.py run --bench         (checks plus every benchmark)
        python kaggle_run.py run --cmd "python softmax_checks.py --no-compile"
        python kaggle_run.py run --internet --cmd "python -m pip install -q --target /tmp/t triton==3.8.0" \
@@ -60,6 +60,8 @@ VERSION_PROBE = [
 CHECK_SCRIPTS = ("layernorm_triton.py", "layernorm_bwd_checks.py", "softmax_checks.py")
 # Runs before the checks: it measures the approximate-math budgets the bounds rely on, in seconds.
 MATH_PROBE = ["python", "probe_math.py"]
+# Runs after the checks: it trains a small model through the autograd wrappers.
+TRAIN_CHECK = ["python", "train_check.py"]
 
 POLL_SECONDS = 15
 RUNNING_STATES = {"QUEUED", "RUNNING", "NEW_SCRIPT"}
@@ -177,9 +179,9 @@ def git_state() -> tuple[str, bool]:
 
 
 def default_commands(bench: bool) -> list[list[str]]:
-    """Commands for a standard run: the math probe, then every check script, with benchmarks only if asked."""
+    """Commands for a standard run: math probe, check scripts (benchmarks only if asked), training-loop check."""
     extra = [] if bench else ["--skip-bench"]
-    return [MATH_PROBE, *(["python", script, *extra] for script in CHECK_SCRIPTS)]
+    return [MATH_PROBE, *(["python", script, *extra] for script in CHECK_SCRIPTS), TRAIN_CHECK]
 
 
 def render_kernel(files: dict[str, bytes], commands: list[list[str]], commit: str, dirty: bool, build_id: str) -> str:
