@@ -320,6 +320,50 @@ fp32 `tl.exp` lowers to `ex2.approx.f32` after an fp32 multiply by log2(e) (Trit
 
 The first model charged 4 ulps per call plus half an ulp per unit of |argument|. That is above the documented bound for |x| below 3 and below it beyond: 1.2x short at |x| = 6, 1.36x at 10, 1.46x at 20. In a softmax row most arguments x - max sit between -3 and -6, and the fp16 store term uses almost the whole bound (CPU ratios up to 0.998), so a GPU run could have failed on a few elements for a reason that had nothing to do with the kernel. The model now follows the documentation: `EXP_ULPS = 2` fixed per call and `EXP_ARG_ULPS = 1.173` per unit of |argument|, both in `common.py`. The CPU ratios did not move, because the store term dominates there. The GPU runs passed with this model. The earlier model was never run in a kernel check on a GPU; the probe shows the exp error exceeding it at one large argument (item 3 above).
 
+## In a training loop
+
+Question: are the autograd wrappers drop-in inside a real model? Every check above tests one kernel alone, on inputs made for the check.
+
+`train_check.py` trains a small transformer: 2 pre-norm blocks, d_model 256, 4 heads, sequence 64, batch 64. LayerNorm runs at width 256, five times per forward pass, and softmax at width 64, twice, on 16384 rows each. fp16 autocast, `GradScaler`, AdamW at 1e-3, 300 steps. The task is to output the next token of a random sequence, which cannot be done without attention. Three variants start from the same weights, see the same batches, and differ only in LayerNorm and the attention softmax:
+
+- torch: `F.layer_norm` and `torch.softmax` as autocast runs them.
+- emulate: PyTorch operations held to the kernels' contract (fp16 in, fp32 arithmetic, fp16 out, fp16 weight and bias). What the kernels should compute, without Triton.
+- triton: `layer_norm_autograd` and `softmax_autograd`.
+
+Kaggle T4, torch 2.11.0, triton 3.6.0, commit `0a4645c`, in the same job as the kernel checks.
+
+Gradients. For each of the 32 parameter tensors the check computes ||a - b|| / ||b|| on a held-out batch; the table gives the largest. It does so at two states of the model: at initialization, where attention is close to uniform, and partly trained, which is the torch variant's weights after step 33, the first step whose loss was below half the starting loss. The limit is 1e-2. The last two columns are the mutation tests: the Triton forward with a deliberately wrong backward, compared with emulate. The wrong softmax backward returns y * dy, without the sum(dy * y) term. The wrong LayerNorm backward returns w * rstd * dy for x, without the two mean terms.
+
+| State | Triton vs emulate | Triton vs torch | Wrong softmax backward | Wrong LayerNorm backward |
+|:---|---:|---:|---:|---:|
+| At initialization | 7.17e-04 | 9.97e-04 | 0.208 | 0.408 |
+| Partly trained | 4.44e-04 | 7.18e-04 | 4.49 | 1.91 |
+
+Loss before each step:
+
+| Step | torch | emulate | triton |
+|---:|---:|---:|---:|
+| 1 | 4.3215 | 4.3215 | 4.3215 |
+| 10 | 4.2109 | 4.2109 | 4.2109 |
+| 20 | 4.0920 | 4.0920 | 4.0920 |
+| 30 | 2.9398 | 2.9400 | 2.9399 |
+| 40 | 0.2561 | 0.2562 | 0.2562 |
+| 50 | 0.0240 | 0.0240 | 0.0240 |
+| 100 | 0.0028 | 0.0028 | 0.0028 |
+| 200 | 0.0013 | 0.0013 | 0.0013 |
+| 300 | 0.0008 | 0.0008 | 0.0008 |
+
+1. Every parameter's gradient agrees within 0.1% at both states, against both references. That is 10 times inside the limit or better.
+2. Both wrong backwards are rejected at both states, by 21 to 449 times the limit. They are hardest to see at initialization (0.21 and 0.41), which is why the comparison is repeated on a partly trained model.
+3. The Triton and emulate losses differ by at most 1.0e-05 over the first 10 steps (limit 1e-3) and by at most 2.4e-04 over all 300. The largest difference is at step 33, in the steepest part of the curve, where the loss falls from 2.9 to 0.26 in ten steps.
+4. All three variants end at a loss of 0.0008 and a held-out accuracy of 1.0000.
+5. An earlier run of the same script, from an uncommitted tree, gave the same four numbers at initialization and the same mutant numbers at both states, to three digits. The numbers that depend on training moved: 4.37e-04 and 7.69e-04 partly trained, 5.3e-06 and 1.9e-04 for the two loss differences. Training on the GPU did not repeat exactly between the two sessions. Nothing came near a limit in either.
+6. Triton against emulate (4e-4 to 7e-4) is not much closer than Triton against torch (7e-4 to 1e-3), although only the second pair differs by the fp16 contract. The likely reason, not investigated: two fp32 computations that differ in their last bits round to different fp16 values on a small share of elements, and each such element is off by a whole fp16 unit, about 5e-4 relative. The per-element bounds in the kernel checks are where rounding is held to account. This check asks a coarser question, whether training sees the right gradients.
+
+How the limit was set. `python train_check.py --emulate` runs emulate against torch on a CPU, with the mutants built on emulate, and needs no kernel. There the fp16 contract alone moved gradients by 5.8e-04 at initialization and 7.6e-04 partly trained, and the two wrong backwards by 0.21 to 4.5. The limit of 1e-2 sits between and was fixed before the kernels were run. That CPU run also caught three faults in the first draft of the check. The model did not learn in 300 steps (6% accuracy). The wrong softmax backward moved no parameter's gradient by more than 9%. And the loss was not scaled on the CPU, so the fp16 gradients lost their digits: with the loss unscaled, emulate against torch at initialization is 5.2e-02, about 90 times the scaled figure. The fixes were position embeddings initialized like the token embeddings, separate query, key and value weights so that the gradients that exist only through the softmax backward are compared on their own, and a fixed loss scale of 65536 on the CPU, which is where `GradScaler` starts on the GPU.
+
+Limits of this check: one small model, one seed, 300 steps, fp16 only, widths 256 and 64, and every tensor the wrappers received was contiguous. It does not time anything, so it says nothing about training speed. bf16 and the wide rows of the benchmarks are covered by the kernel checks only.
+
 ## Fused attention: measured, not built
 
 Question: can a fused Triton attention forward beat PyTorch on this GPU? A fused kernel never writes the L x L score matrix to memory. But it has to do both matrix products itself, and Triton lowers `tl.dot` to plain fp32 multiply-adds below compute capability 8.0 (`lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp`: "Dot op using MMA for compute capability ... has been deprecated. It falls back to the FMA path"; the same text in 3.6.0 and 3.8.0). The T4 is 7.5. PyTorch's matmul uses the T4's tensor cores.
@@ -351,4 +395,5 @@ Limits of the verdict: one head dimension, non-causal, six hand-picked settings 
 - Whether the LayerNorm forward beats `torch.compile` at N = 16384 and 32768 depends on the torch version: it did on torch 2.14.1 and does not on torch 2.11.0. Only the newer result has been repeated.
 - At N = 32768 the dx kernel keeps 26 spill instructions at 8 warps and runs at 207 GB/s against 247 GB/s at N = 16384. Accepted: the measured alternative was slower, and 32768 is the top of the fp16 single-block range.
 - The attention verdict is for the T4 only. On compute capability 8.0 or higher, rerun `probe_attention.py` before deciding anything. Kaggle would not provide such a GPU on this account (2026-11-16): asked for `NvidiaL4X1` it ran two T4s, and asked for `NvidiaL4` it ran a session with no GPU, both without an error. `kaggle_run.py` now fails a run whose GPU is not the one requested.
+- The training-loop check is one small model at LayerNorm width 256 and softmax width 64, fp16, one seed. Nothing was trained in bf16 or at the wide rows, and no training speed was measured.
 - All numbers are from one GPU model. The switch point and the warp cap are T4 measurements; rerun `probe_spills.py` and both benchmarks before trusting them on another GPU.

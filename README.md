@@ -20,6 +20,8 @@ The repo also has a softmax built on the same error model, with an online forwar
 
 Softmax is not a speed win over inductor. It is here because its error model has to budget for the GPU's approximate exp and division, and the GPU run is the only test of that budget: every element of every case stayed inside its bound. `probe_math.py` then measures the budgets directly: on the T4 the worst exp, division and 1 / sqrt results use 0.50, 0.41 and 0.31 of what the model allows. It also shows Triton's exp slightly outside the bound NVIDIA documents for `__expf`, so the budget rests on that measurement and not on the documentation.
 
+Both autograd wrappers were then put inside a model. `train_check.py` trains a small transformer on the T4 three times from the same weights and batches: with PyTorch's LayerNorm and softmax, with PyTorch operations held to the kernels' fp16 contract, and with the Triton wrappers. Every parameter's gradient agrees within 0.1%, at initialization and partly trained; the Triton loss stays within 3e-4 of the reference at every one of 300 steps and all three runs end at the same loss and 100% held-out accuracy; and two deliberately wrong backwards are rejected by 20 to 450 times the limit.
+
 ## What is different here
 
 LayerNorm kernels are a Triton tutorial. The verification is the point of this repo.
@@ -44,6 +46,7 @@ LayerNorm kernels are a Triton tutorial. The verification is the point of this r
 | `probe_math.py` | The GPU's fp32 exp, division and 1 / sqrt error in ulps, against the budgets the bounds assume |
 | `probe_attention.py` | Go / no-go probe for a fused attention forward: a prototype against PyTorch's attention |
 | `softmax_cpu_check.py` | The softmax error bound against an fp32 emulation of the kernels; runs without a GPU or Triton |
+| `train_check.py` | Training-loop check: a small transformer trained through both autograd wrappers, against PyTorch's operations, with mutation tests |
 | `kaggle_run.py` | Runs the checks or benchmarks on a Kaggle T4 from the command line and returns the result |
 | `RESULTS.md` | Measurements and decisions |
 
@@ -62,12 +65,14 @@ python probe_spills.py --n 16384 32768        # registers and spills per kernel
 python probe_math.py                          # exp, division and 1/sqrt error against the budgets
 python probe_attention.py                     # is a fused attention kernel worth building on this GPU?
 python softmax_cpu_check.py                   # error-model check, no GPU needed
+python train_check.py                         # train a small model through both autograd wrappers
+python train_check.py --emulate               # the same script on the CPU, without Triton: tests the script
 ```
 
 Without a local GPU, `kaggle_run.py` does the upload and the run. It needs the [Kaggle CLI](https://github.com/Kaggle/kaggle-cli) (`uv tool install kaggle --with six`, then `kaggle auth login`) and the kernel owner in `KERNEL_ID` at the top of the script set to your Kaggle username.
 
 ```
-python kaggle_run.py run            # math probe and every check on a Kaggle T4, a few minutes
+python kaggle_run.py run            # math probe, every check and the training-loop check on a Kaggle T4, a few minutes
 python kaggle_run.py run --bench    # checks plus every benchmark
 ```
 
@@ -90,5 +95,5 @@ y = layer_norm_autograd(x, weight, bias)   # x: fp16 or bf16 CUDA tensor of shap
 - The Colab and Kaggle numbers come from different torch and triton versions. RESULTS.md has LayerNorm on both; the two disagree on whether the forward beats `torch.compile` at N ≥ 16384.
 - The backward numbers at N = 32768 assume Triton 3.8.0 or later. On 3.6.0 and 3.7.1 Triton generates code that spills more registers there, and the backward is 9 to 12% slower at that width only. Measured on one GPU with only Triton changed; see RESULTS.md.
 - The approximate-math budgets were measured on one GPU model and one Triton version. Run `probe_math.py` before trusting the bounds on another.
-- The autograd wrappers are tested in isolation, not inside a training loop.
+- The training-loop check is one small model: LayerNorm at width 256, softmax at width 64, fp16, 300 steps, one seed, contiguous tensors. It shows the wrappers are drop-in there. It does not time them, and it does not cover bf16 or the wide rows the benchmarks use.
 - The LayerNorm bound assumes no fp32 overflow or underflow. Both bounds assume approximate sqrt, division and exp stay within stated ulp budgets; the constants are in `common.py`.
