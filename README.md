@@ -28,6 +28,7 @@ LayerNorm kernels are a Triton tutorial. The verification is the point of this r
 - **Mutation tests prove the bound has teeth.** Deliberately broken kernels (a dropped bias, a dropped gradient term, an off-by-one in the reduction) run against the same checks. The bound rejects all of them. `allclose` misses all of them.
 - **Determinism and batch invariance.** No atomics. Two launches are bitwise equal, and a row's output does not depend on which other rows share its batch. The checks assert both.
 - **Measured, not assumed.** The backward switches between two kernel layouts at N = 16384 because the fused kernel was measured spilling registers there. A third layout designed to fix a predicted spill at N = 32768 was measured slower and removed; its numbers stay in RESULTS.md. `probe_spills.py` reports registers, spills and time per kernel so the next change can be measured the same way.
+- **Not built, on evidence.** A fused attention kernel was the obvious next step. A go/no-go probe measured a prototype at a tenth of PyTorch's speed on the T4, because Triton cannot use tensor cores below compute capability 8.0. The kernel was not built; the probe and its numbers are kept.
 
 ## Files
 
@@ -41,6 +42,7 @@ LayerNorm kernels are a Triton tutorial. The verification is the point of this r
 | `softmax_triton.py` | Softmax forward (block and online) and backward (block and tiled) kernels, launchers, autograd wrapper |
 | `softmax_checks.py` | Softmax error bound, checks, mutation tests, benchmark |
 | `probe_math.py` | The GPU's fp32 exp, division and 1 / sqrt error in ulps, against the budgets the bounds assume |
+| `probe_attention.py` | Go / no-go probe for a fused attention forward: a prototype against PyTorch's attention |
 | `softmax_cpu_check.py` | The softmax error bound against an fp32 emulation of the kernels; runs without a GPU or Triton |
 | `kaggle_run.py` | Runs the checks or benchmarks on a Kaggle T4 from the command line and returns the result |
 | `RESULTS.md` | Measurements and decisions |
@@ -58,6 +60,7 @@ python layernorm_bwd_checks.py                # checks plus backward benchmark
 python softmax_checks.py                      # checks plus both softmax benchmarks
 python probe_spills.py --n 16384 32768        # registers and spills per kernel
 python probe_math.py                          # exp, division and 1/sqrt error against the budgets
+python probe_attention.py                     # is a fused attention kernel worth building on this GPU?
 python softmax_cpu_check.py                   # error-model check, no GPU needed
 ```
 

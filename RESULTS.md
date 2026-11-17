@@ -320,6 +320,29 @@ fp32 `tl.exp` lowers to `ex2.approx.f32` after an fp32 multiply by log2(e) (Trit
 
 The first model charged 4 ulps per call plus half an ulp per unit of |argument|. That is above the documented bound for |x| below 3 and below it beyond: 1.2x short at |x| = 6, 1.36x at 10, 1.46x at 20. In a softmax row most arguments x - max sit between -3 and -6, and the fp16 store term uses almost the whole bound (CPU ratios up to 0.998), so a GPU run could have failed on a few elements for a reason that had nothing to do with the kernel. The model now follows the documentation: `EXP_ULPS = 2` fixed per call and `EXP_ARG_ULPS = 1.173` per unit of |argument|, both in `common.py`. The CPU ratios did not move, because the store term dominates there. The GPU runs passed with this model. The earlier model was never run in a kernel check on a GPU; the probe shows the exp error exceeding it at one large argument (item 3 above).
 
+## Fused attention: measured, not built
+
+Question: can a fused Triton attention forward beat PyTorch on this GPU? A fused kernel never writes the L x L score matrix to memory. But it has to do both matrix products itself, and Triton lowers `tl.dot` to plain fp32 multiply-adds below compute capability 8.0 (`lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp`: "Dot op using MMA for compute capability ... has been deprecated. It falls back to the FMA path"; the same text in 3.6.0 and 3.8.0). The T4 is 7.5. PyTorch's matmul uses the T4's tensor cores.
+
+`probe_attention.py` measures it before anything larger is built. It times a prototype fused forward (online softmax over key tiles, six block and warp settings) against `F.scaled_dot_product_attention`, the written-out `softmax(q @ k^T * scale) @ v`, and `torch.compile` of the written-out form. Batch 4, 8 heads, head dimension 64, fp16, non-causal. Kaggle T4, torch 2.11.0, triton 3.6.0, commit `81f6476`. TFLOPS counts the two matrix products.
+
+| L | Built-in ms | TFLOPS | Written-out ms | TFLOPS | Compile ms | TFLOPS | Triton best ms | TFLOPS | Best setting | Triton vs best PyTorch |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---|---:|
+| 256 | 0.1345 | 3.99 | 0.2033 | 2.64 | 0.1346 | 3.99 | 0.8841 | 0.61 | 64x32, 4 warps | 0.15x |
+| 512 | 0.3174 | 6.77 | 0.5383 | 3.99 | 0.1592 | 13.49 | 1.5754 | 1.36 | 32x32, 4 warps | 0.10x |
+| 1024 | 0.6172 | 13.92 | 2.0184 | 4.26 | 0.5569 | 15.43 | 6.3193 | 1.36 | 32x32, 4 warps | 0.09x |
+| 2048 | 2.5841 | 13.30 | 8.0322 | 4.28 | 2.5975 | 13.23 | 24.8423 | 1.38 | 32x32, 4 warps | 0.10x |
+
+1. The fused kernel is slower at every length, by 7 to 11 times. An earlier run of the same probe gave 0.09x to 0.16x.
+2. No setting of the prototype exceeds 1.4 TFLOPS in either run. PyTorch reaches 13 to 15 TFLOPS from L = 1024.
+3. Tuning cannot close that. NVIDIA publishes 8.1 TFLOPS single precision and 65 TFLOPS fp16 on tensor cores for the T4. A kernel limited to fp32 multiply-adds is capped by the first figure, and PyTorch already measures above it. That cap is NVIDIA's number, not a measurement made here.
+4. The memory traffic that fusing saves is not the bottleneck on this GPU. The written-out form pays for the whole score matrix, runs at 4.3 TFLOPS, and is still 3 times faster than the prototype.
+5. `torch.compile` of the written-out form matches the built-in from L = 1024 and is twice as fast at L = 512 (0.16 against 0.32 ms).
+
+Decision: stop. No checked attention kernel is built for this GPU. The rule was set before the measurement: build it only if the prototype beats PyTorch somewhere.
+
+Limits of the verdict: one head dimension, non-causal, six hand-picked settings without autotuning, and a prototype checked only against an fp32 reference with a fixed tolerance. Those could move the result by tens of percent, not by 7 times. On a GPU with compute capability 8.0 or higher Triton does use tensor cores, and the answer may be different; `probe_attention.py` is kept so it can be asked there first.
+
 ## Open items
 
 - The approximate-math budgets rest on a measurement on one GPU model and one Triton version, not on a documented guarantee: Triton's exp is slightly outside NVIDIA's documented `__expf` bound. `kaggle_run.py run` runs `probe_math.py` before the checks, so a new Triton version or GPU that uses more of a budget shows up there first. Run it before trusting the bounds anywhere else.
@@ -327,4 +350,5 @@ The first model charged 4 ulps per call plus half an ulp per unit of |argument|.
 - The LayerNorm benchmark tables on the Kaggle versions are from one run. The forward at N = 32768 varies by about 5% between samples on one GPU.
 - Whether the LayerNorm forward beats `torch.compile` at N = 16384 and 32768 depends on the torch version: it did on torch 2.14.1 and does not on torch 2.11.0. Only the newer result has been repeated.
 - At N = 32768 the dx kernel keeps 26 spill instructions at 8 warps and runs at 207 GB/s against 247 GB/s at N = 16384. Accepted: the measured alternative was slower, and 32768 is the top of the fp16 single-block range.
+- The attention verdict is for the T4 only. On compute capability 8.0 or higher, rerun `probe_attention.py` before deciding anything.
 - All numbers are from one GPU model. The switch point and the warp cap are T4 measurements; rerun `probe_spills.py` and both benchmarks before trusting them on another GPU.
