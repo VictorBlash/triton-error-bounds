@@ -41,6 +41,7 @@ LayerNorm kernels are a Triton tutorial. The verification is the point of this r
 | `softmax_triton.py` | Softmax forward (block and online) and backward (block and tiled) kernels, launchers, autograd wrapper |
 | `softmax_checks.py` | Softmax error bound, checks, mutation tests, benchmark |
 | `softmax_cpu_check.py` | The softmax error bound against an fp32 emulation of the kernels; runs without a GPU or Triton |
+| `kaggle_run.py` | Runs the checks or benchmarks on a Kaggle T4 from the command line and returns the result |
 | `RESULTS.md` | Measurements and decisions |
 
 ## Running
@@ -57,6 +58,15 @@ python softmax_checks.py                      # checks plus both softmax benchma
 python probe_spills.py --n 16384 32768        # registers and spills per kernel
 python softmax_cpu_check.py                   # error-model check, no GPU needed
 ```
+
+Without a local GPU, `kaggle_run.py` does the upload and the run. It needs the [Kaggle CLI](https://github.com/Kaggle/kaggle-cli) (`uv tool install kaggle --with six`, then `kaggle auth login`) and the kernel owner in `KERNEL_ID` at the top of the script set to your Kaggle username.
+
+```
+python kaggle_run.py run            # every check on a Kaggle T4, a few minutes
+python kaggle_run.py run --bench    # checks plus every benchmark
+```
+
+It packs every module into one private Kaggle script, so a file cannot be left out of an upload, and it prints the git commit the run was built from. The exit status is 0 only if every command passed.
 
 Every check prints an `ok` line; a failure raises with the check name and, for the bound, the worst element. The benchmarks include eager PyTorch and `torch.compile` columns; `--no-compile` leaves the compiled one out.
 
