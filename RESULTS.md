@@ -155,7 +155,7 @@ Everything below ran on Kaggle's "GPU T4 x2" accelerator; the scripts use the fi
 
 ## LayerNorm on the Kaggle versions
 
-One run. The checks pass, as they did on Colab.
+One run. A second run on 2026-11-17 reproduced 45 of the 49 cells within 3%; "Mean against median" below has the four that moved. The checks pass, as they did on Colab.
 
 | N | Triton ms | GB/s | Eager ms | GB/s | Compile ms | GB/s | vs eager | vs compile |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -247,9 +247,9 @@ The checks also print the largest |error| / bound per path. Leaving out the resu
 
 GB/s counts one read of x and one write of y. The online path reads x twice, so its real bandwidth is higher than the column shows. The two "vs" columns compare the default path.
 
-- Against `torch.compile` the forward is a tie up to N = 8192 (0.96x to 1.03x) and at 65536 (0.99x). The block kernel wins at N = 16384 (1.13x; 1.09x in the first run) and at N = 32768 (1.34x), where inductor's softmax drops to 205 and 174 GB/s.
+- Against `torch.compile` the forward is a tie up to N = 8192 (0.96x to 1.03x) and at 65536 (0.99x). The block kernel wins at N = 16384 (1.13x; 1.09x in the first run) and at N = 32768 (1.34x), where inductor's softmax drops to 205 and 174 GB/s. In a third run inductor's kernel was 5 to 9% slower from N = 4096 up, which moves these figures to 1.07x, 1.06x, 1.24x and 1.41x at N = 4096 to 32768; see "Mean against median".
 - The block kernel holds 223 to 233 GB/s from N = 1024 to 32768.
-- Eager `F.softmax` is not monotonic: 166 to 241 GB/s up to N = 16384, then 171 and 127 GB/s. At N = 16384 eager is 4% faster than the block kernel, in both runs. That is the one width where this forward loses to eager.
+- Eager `F.softmax` is not monotonic: 166 to 241 GB/s up to N = 16384, then 171 and 127 GB/s. At N = 16384 eager is 4% faster than the block kernel in both runs, and 0.7% faster in a third. That is the one width where this forward loses to eager.
 - Above the block limit the online kernel ties inductor (0.99x) and beats eager by 1.27x.
 - The online kernel matches the block kernel where the row is one tile and wide enough to amortise its extra loop (N = 1024 to 4096, within 3%), is 13% slower at N = 512 (24% in the first run), and is 1.3 to 1.45 times slower from N = 8192 up. Counting its real traffic (x read twice, y written once) it moves 240 GB/s at N = 16384 and above. It is at the bandwidth ceiling and slow only because it moves 3/2 the bytes. This is the same result as the LayerNorm tiled experiment.
 
@@ -278,6 +278,30 @@ GB/s counts one read each of dy and y and one write of dx. The tiled path reads 
 Decision: the block path stays the default up to N = 32768 and the tiled path is used only above it.
 
 What softmax adds to this repo is therefore not speed over inductor. It is the error model exercised on approximate GPU exp and division, and kernels that are checked per element for rows wider than one block.
+
+## Mean against median
+
+Question: every table above is a mean (see the note at the top of this file). Do a few slow runs pull any figure away from the typical run?
+
+Method: `do_bench(fn, return_mode="all")` returns every timed run, so each benchmark now prints a second table from the same runs: the median, median / mean, and the number of runs. One job, `kaggle_run.py run --bench` from a clean tree at commit `d82bc47` on 2026-11-17, in the Kaggle environment above (T4, torch 2.11.0, triton 3.6.0). All four benchmarks, 111 cells. The checks in the same job passed.
+
+| Cells | Count | Median / mean |
+|:---|---:|:---|
+| Triton kernels, every path and width | 51 | 0.995 to 1.003 |
+| Eager and `torch.compile`, all but the seven below | 53 | 0.993 to 1.006 |
+| Softmax forward, eager, N = 4096 and 8192 | 2 | 0.992 and 1.019 |
+| Softmax forward, `torch.compile`, N = 4096, 8192, 16384 | 3 | 0.957, 0.972, 0.959 |
+| LayerNorm forward, eager, N = 512 and 1024 | 2 | 1.217 and 0.794 |
+
+1. For every Triton kernel the mean and the median agree within 0.5%. The old "median" label was wrong, but no kernel figure in this file moves by more than that under the other statistic.
+2. Eager LayerNorm forward is not stable at N = 512 and 1024. This run measured means of 0.0848 and 0.0981 ms and medians of 0.1032 and 0.0779 ms; the Kaggle table has 0.1038 and 0.0873. "vs eager" at those two widths is therefore somewhere between 1.0x and 2.4x: 1.93x and 1.28x by this run's mean, 2.35x and 1.01x by its median, 2.38x and 1.15x in the table. The individual run times were not saved, so the shape of the spread is not known.
+3. Inductor's softmax forward is not stable from N = 4096 to 32768. Its mean is 3 to 4% above its median at N = 4096 to 16384, and both are above the table: the mean by 5 to 9% at all four widths, the median by 1 to 6%. The block kernel is within 0.8% of the table at every width. So against `torch.compile` the softmax forward reads 1.07x, 1.06x, 1.24x and 1.41x at N = 4096, 8192, 16384 and 32768 by mean, and 1.03x, 1.03x, 1.19x and 1.41x by median, where the table has 1.01x, 0.96x, 1.13x and 1.34x. The wins at 16384 and 32768 appear in all three runs; their size depends on the run.
+4. The means of this run are within 3% of the Kaggle tables in 98 of 111 cells, and within 0.8% in all 31 softmax backward cells. Of the 13 outside, 11 are baselines: the six cells in findings 2 and 3, eager softmax forward at N = 512, 4096, 8192 and 16384 (3 to 6% slower), and eager LayerNorm backward at N = 512 (11% faster). Two are Triton kernels at N = 512: the split backward (7.5% faster) and the online softmax forward (14% slower). In both, mean and median agree within 0.1%, so each run was steady and the difference is between runs. Every other kernel cell is within 1.5%.
+5. Run counts are small. `do_bench` sets the count to 100 ms over its estimate of one iteration, and the estimate includes the cache flush it does before each run, about 1.2 ms on this GPU (inferred from the counts: 80 runs for a 0.04 ms kernel). So no cell has more than 83 runs, and slow ones have few: 27 at 2.5 ms, 12 at 6.6 ms, 7 at 12 ms, and 1 for the fused backward at N = 32768 (65 ms). Five cells have fewer than 10 runs: the fused backward at N = 16384 and 32768, and the three softmax backward columns that run at N = 65536. By the same arithmetic the 38 to 65 ms figures under "Triton version and the N = 32768 backward" are one or two runs each.
+
+Decision: the tables stay as they are, as means, and both statistics are printed from now on. Switching to the median would change no kernel figure by more than 0.5%, and it would not steady the unstable baselines: this run's medians are also 5 to 6% above the table for inductor's softmax forward at N = 8192 to 32768, and 11% below it for eager LayerNorm forward at N = 1024. Read "vs eager" for the LayerNorm forward at N ≤ 1024 and "vs compile" for the softmax forward at N ≥ 4096 as ranges, not single figures.
+
+Limits: one run. Why those two baselines move was not investigated.
 
 ## Approximate-math budgets, measured
 
@@ -391,7 +415,9 @@ Limits of the verdict: one head dimension, non-causal, six hand-picked settings 
 
 - The approximate-math budgets rest on a measurement on one GPU model and one Triton version, not on a documented guarantee: Triton's exp is slightly outside NVIDIA's documented `__expf` bound. `kaggle_run.py run` runs `probe_math.py` before the checks, so a new Triton version or GPU that uses more of a budget shows up there first. Run it before trusting the bounds anywhere else.
 - The backward numbers at N = 32768 assume Triton 3.8.0 or later. On 3.6.0 and 3.7.1 the dx kernel spills more and the split backward is 9 to 12% slower there. The Triton change responsible, somewhere between 3.7.1 and 3.8.0 in the code it generates, was not identified.
-- The LayerNorm benchmark tables on the Kaggle versions are from one run. The forward at N = 32768 varies by about 5% between samples on one GPU.
+- The LayerNorm benchmark tables on the Kaggle versions are from one run, reproduced once (45 of 49 cells within 3%). The forward at N = 32768 varies by about 5% between samples on one GPU.
+- Two baselines move between runs on the Kaggle T4 by more than the kernels do: eager LayerNorm forward at N ≤ 1024 (up to 18%) and inductor's softmax forward at N = 4096 to 32768 (5 to 9%). The cause was not investigated and the individual run times were not saved. Comparisons against them are ranges.
+- No table was measured on the releases current on 2026-11-17, torch 2.15.0 with triton 3.9.0. The `torch.compile` columns depend on the torch version, as the two LayerNorm forward results show.
 - Whether the LayerNorm forward beats `torch.compile` at N = 16384 and 32768 depends on the torch version: it did on torch 2.14.1 and does not on torch 2.11.0. Only the newer result has been repeated.
 - At N = 32768 the dx kernel keeps 26 spill instructions at 8 warps and runs at 207 GB/s against 247 GB/s at N = 16384. Accepted: the measured alternative was slower, and 32768 is the top of the fp16 single-block range.
 - The attention verdict is for the T4 only. On compute capability 8.0 or higher, rerun `probe_attention.py` before deciding anything. Kaggle would not provide such a GPU on this account (2026-11-16): asked for `NvidiaL4X1` it ran two T4s, and asked for `NvidiaL4` it ran a session with no GPU, both without an error. `kaggle_run.py` now fails a run whose GPU is not the one requested.

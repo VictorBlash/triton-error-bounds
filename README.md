@@ -15,7 +15,7 @@ The repo also has a softmax built on the same error model, with an online forwar
 
 | | vs eager PyTorch | vs torch.compile | Bandwidth |
 |:---|:---|:---|:---|
-| Forward | 1.1–1.4x, except 0.96x at N = 16384 | a tie up to N = 8192 (0.96–1.03x); 1.1x at 16384, 1.34x at 32768 | about 230 GB/s up to N = 32768 |
+| Forward | 1.1–1.4x, except 0.96–0.99x at N = 16384 | a tie up to N = 8192 (0.96–1.07x across three runs); 1.1–1.2x at 16384, 1.3–1.4x at 32768 | about 230 GB/s up to N = 32768 |
 | Backward | 1.9–2.1x up to N = 32768, 1.4x at 65536 | a tie: 0.97–1.01x, except 1.22x at N = 32768 | 220–240 GB/s up to N = 32768 |
 
 Softmax is not a speed win over inductor. It is here because its error model has to budget for the GPU's approximate exp and division, and the GPU run is the only test of that budget: every element of every case stayed inside its bound. `probe_math.py` then measures the budgets directly: on the T4 the worst exp, division and 1 / sqrt results use 0.50, 0.41 and 0.31 of what the model allows. It also shows Triton's exp slightly outside the bound NVIDIA documents for `__expf`, so the budget rests on that measurement and not on the documentation.
@@ -93,6 +93,7 @@ y = layer_norm_autograd(x, weight, bias)   # x: fp16 or bf16 CUDA tensor of shap
 - LayerNorm rows must fit one block: N ≤ 32768 for fp16 and bf16. Softmax has no such limit, but above it uses the slower two-pass paths.
 - Tuning constants (the layout switch at N = 16384, the 8-warp cap on the dx kernel, the softmax block limit and tile width) are T4 measurements. Rerun the probe and benchmarks before trusting them on another GPU.
 - The Colab and Kaggle numbers come from different torch and triton versions. RESULTS.md has LayerNorm on both; the two disagree on whether the forward beats `torch.compile` at N ≥ 16384.
+- Timings are means over `do_bench`'s timed runs; the benchmarks print the median beside them. For the Triton kernels the two agree within 0.5%. Two baseline columns move between runs on the Kaggle T4 (eager LayerNorm forward at N ≤ 1024, inductor's softmax forward at N ≥ 4096), so comparisons against them are ranges. No table was measured on torch 2.15.0 with triton 3.9.0.
 - The backward numbers at N = 32768 assume Triton 3.8.0 or later. On 3.6.0 and 3.7.1 Triton generates code that spills more registers there, and the backward is 9 to 12% slower at that width only. Measured on one GPU with only Triton changed; see RESULTS.md.
 - The approximate-math budgets were measured on one GPU model and one Triton version. Run `probe_math.py` before trusting the bounds on another.
 - The training-loop check is one small model: LayerNorm at width 256, softmax at width 64, fp16, 300 steps, one seed, contiguous tensors. It shows the wrappers are drop-in there. It does not time them, and it does not cover bf16 or the wide rows the benchmarks use.

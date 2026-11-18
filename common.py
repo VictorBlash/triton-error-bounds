@@ -171,8 +171,10 @@ def time_fn(fn: Callable[[], object]) -> Timing:
 
     do_bench returns the mean unless asked for another statistic. Asking for every run
     lets one measurement give the mean, which the main tables print, and the median, which
-    shows whether a few slow runs pulled that mean up. do_bench times for about 100 ms, so
-    the number of runs is 100 ms over the run time, at least 1: slow kernels get few runs.
+    shows whether a few slow runs pulled that mean up. do_bench sets the number of runs to
+    100 ms over its estimate of one iteration, at least 1, and the estimate includes the
+    cache flush it does before each run (about 1.2 ms on a T4). So a fast kernel gets about
+    80 runs and a slow one few: 12 at 6.6 ms, 1 at 65 ms (RESULTS.md).
 
     Returns:
         Mean, median and number of timed runs.
