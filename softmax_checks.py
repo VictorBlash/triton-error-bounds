@@ -45,11 +45,14 @@ from common import (
     assert_within_bound,
     compile_fresh,
     exp_err,
+    mean_cell,
     mul_err,
     parity_tolerances,
+    print_median_table,
     require_cuda,
     store_err,
     sum_err,
+    time_fn,
 )
 from softmax_triton import (
     BWD_PATHS,
@@ -429,18 +432,16 @@ def _print_table(
 
     `rows` is consumed one width at a time. Pass a generator, not a list: each width's
     tensors and its fresh torch.compile cache must exist only while that width is timed.
+    A second table gives the median of the same runs.
     """
     print(f"\n{title}, mean ms and GB/s")
     print(f"{'N':>6}  " + "  ".join(f"{nm + ' ms':>10} {'GB/s':>6}" for nm in names))
+    measured = []
     for n, fns, nbytes in rows:
-        cells = []
-        for fn in fns:
-            if fn is None:
-                cells.append(f"{'-':>10} {'-':>6}")
-                continue
-            ms = triton.testing.do_bench(fn)
-            cells.append(f"{ms:10.4f} {nbytes / (ms * 1e-3) / 1e9:6.1f}")
-        print(f"{n:>6}  {'  '.join(cells)}")
+        timings = [None if fn is None else time_fn(fn) for fn in fns]
+        print(f"{n:>6}  {'  '.join(mean_cell(t, nbytes) for t in timings)}")
+        measured.append((n, timings))
+    print_median_table(title, names, measured)
 
 
 def benchmark(device: str, dtype: torch.dtype = torch.float16, m: int = 4096, compile_baseline: bool = True) -> None:

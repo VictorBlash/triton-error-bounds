@@ -40,12 +40,15 @@ from common import (
     UNIT_ROUNDOFF,
     add_err,
     compile_fresh,
+    mean_cell,
     mean_err,
     mul_err,
     num_warps_for,
     parity_tolerances,
+    print_median_table,
     require_cuda,
     store_err,
+    time_fn,
 )
 
 EPS = 1e-5
@@ -386,26 +389,26 @@ CASES: list[tuple[tuple[int, ...], torch.dtype, float, str]] = [
 def benchmark(device: str, dtype: torch.dtype = torch.float16, m: int = 4096, compile_baseline: bool = True) -> None:
     """Print mean forward time and effective bandwidth for Triton, eager and torch.compile.
 
-    do_bench handles warmup, cache flushing and repeats, and returns the mean of its timed
-    runs unless asked for another statistic. Bandwidth counts one read of x,
+    do_bench handles warmup, cache flushing and repeats. Bandwidth counts one read of x,
     one write of y, and one read each of weight and bias. The compiled column is
     inductor's own generated kernel for the same shape, the baseline a custom kernel has
-    to beat to be worth keeping.
+    to beat to be worth keeping. A second table gives the median of the same runs.
     """
     names = ["triton", "eager"] + (["compile"] if compile_baseline else [])
-    print(f"\nforward benchmark: M={m}, dtype={dtype}, mean ms and GB/s")
+    title = f"forward benchmark: M={m}, dtype={dtype}"
+    print(f"\n{title}, mean ms and GB/s")
     print(f"{'N':>6}  " + "  ".join(f"{nm + ' ms':>10} {'GB/s':>6}" for nm in names))
+    rows = []
     for n in BENCH_WIDTHS:
         x, w, b = make_inputs((m, n), dtype, device)
         bytes_moved = (2 * m * n + 2 * n) * x.element_size()
         fns = [layer_norm_triton, layer_norm_eager]
         if compile_baseline:
             fns.append(compile_fresh(layer_norm_eager))
-        cells = []
-        for fn in fns:
-            ms = triton.testing.do_bench(lambda fn=fn: fn(x, w, b))
-            cells.append(f"{ms:10.4f} {bytes_moved / (ms * 1e-3) / 1e9:6.1f}")
-        print(f"{n:>6}  {'  '.join(cells)}")
+        timings = [time_fn(lambda fn=fn: fn(x, w, b)) for fn in fns]
+        print(f"{n:>6}  {'  '.join(mean_cell(t, bytes_moved) for t in timings)}")
+        rows.append((n, timings))
+    print_median_table(title, names, rows)
 
 
 def main() -> int:

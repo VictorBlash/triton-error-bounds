@@ -38,11 +38,14 @@ from common import (
     assert_within_bound,
     compile_fresh,
     gamma,
+    mean_cell,
     mean_err,
     mul_err,
     parity_tolerances,
+    print_median_table,
     require_cuda,
     store_err,
+    time_fn,
 )
 from layernorm_triton import (
     BENCH_WIDTHS,
@@ -329,11 +332,14 @@ def benchmark(device: str, dtype: torch.dtype = torch.float16, m: int = 4096, co
     GB/s uses the same byte count for all columns: one read each of x and dy and one write
     of dx, the traffic any backward must move. The split path's extra reads show up as
     lower GB/s rather than as a different formula, so the columns compare directly.
+    A second table gives the median of the same runs.
     """
     names = [*PATHS, "eager"] + (["compile"] if compile_baseline else [])
-    print(f"\nbackward benchmark: M={m}, dtype={dtype}, mean ms and GB/s")
+    title = f"backward benchmark: M={m}, dtype={dtype}"
+    print(f"\n{title}, mean ms and GB/s")
     header = "  ".join(f"{nm + ' ms':>10} {'GB/s':>6}" for nm in names)
     print(f"{'N':>6}  {header}  default")
+    rows = []
     for n in BENCH_WIDTHS:
         x, w, b = make_inputs((m, n), dtype, device)
         dy = torch.randn_like(x)
@@ -346,11 +352,10 @@ def benchmark(device: str, dtype: torch.dtype = torch.float16, m: int = 4096, co
         runs.append(_backward_runner(layer_norm_eager, x, w, b, dy))
         if compile_baseline:
             runs.append(_backward_runner(compile_fresh(layer_norm_eager), x, w, b, dy))
-        cells = []
-        for fn in runs:
-            ms = triton.testing.do_bench(fn)
-            cells.append(f"{ms:10.4f} {bytes_moved / (ms * 1e-3) / 1e9:6.1f}")
-        print(f"{n:>6}  {'  '.join(cells)}  {default_path(n)}")
+        timings = [time_fn(fn) for fn in runs]
+        print(f"{n:>6}  {'  '.join(mean_cell(t, bytes_moved) for t in timings)}  {default_path(n)}")
+        rows.append((n, timings))
+    print_median_table(title, names, rows)
 
 
 def main() -> int:

@@ -15,8 +15,10 @@
 
 from __future__ import annotations
 
+import statistics
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+from typing import NamedTuple
 
 import torch
 
@@ -154,6 +156,54 @@ def compile_fresh(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor
     """
     torch.compiler.reset()
     return torch.compile(fn, dynamic=False)
+
+
+class Timing(NamedTuple):
+    """One benchmark cell: statistics over the timed runs of one do_bench call, in ms."""
+
+    mean: float
+    median: float
+    runs: int
+
+
+def time_fn(fn: Callable[[], object]) -> Timing:
+    """Time `fn` with triton.testing.do_bench and summarize every timed run.
+
+    do_bench returns the mean unless asked for another statistic. Asking for every run
+    lets one measurement give the mean, which the main tables print, and the median, which
+    shows whether a few slow runs pulled that mean up. do_bench times for about 100 ms, so
+    the number of runs is 100 ms over the run time, at least 1: slow kernels get few runs.
+
+    Returns:
+        Mean, median and number of timed runs.
+    """
+    import triton  # here, not at the top: this module also loads where Triton is not installed
+
+    times = triton.testing.do_bench(fn, return_mode="all")
+    return Timing(statistics.mean(times), statistics.median(times), len(times))
+
+
+def mean_cell(timing: Timing | None, nbytes: int) -> str:
+    """Main-table cell: mean ms and effective GB/s. None, a path that cannot run, prints dashes."""
+    if timing is None:
+        return f"{'-':>10} {'-':>6}"
+    return f"{timing.mean:10.4f} {nbytes / (timing.mean * 1e-3) / 1e9:6.1f}"
+
+
+def print_median_table(title: str, names: Sequence[str], rows: Sequence[tuple[int, Sequence[Timing | None]]]) -> None:
+    """Print the companion table: median ms, median / mean and timed runs for every cell.
+
+    The cells come from the same timed runs as the main table. A ratio well under 1 means
+    a few slow runs raised the mean there.
+    """
+    print(f"\n{title}, median ms, median / mean and timed runs")
+    print(f"{'N':>6}  " + "  ".join(f"{nm + ' ms':>10} {'ratio':>6} {'runs':>5}" for nm in names))
+    for n, timings in rows:
+        cells = [
+            f"{'-':>10} {'-':>6} {'-':>5}" if t is None else f"{t.median:10.4f} {t.median / t.mean:6.3f} {t.runs:5d}"
+            for t in timings
+        ]
+        print(f"{n:>6}  {'  '.join(cells)}")
 
 
 def require_cuda() -> str | None:
