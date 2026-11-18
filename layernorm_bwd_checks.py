@@ -324,14 +324,14 @@ def _backward_runner(
 
 
 def benchmark(device: str, dtype: torch.dtype = torch.float16, m: int = 4096, compile_baseline: bool = True) -> None:
-    """Print median backward time for every path, eager PyTorch and torch.compile.
+    """Print mean backward time for every path, eager PyTorch and torch.compile.
 
     GB/s uses the same byte count for all columns: one read each of x and dy and one write
     of dx, the traffic any backward must move. The split path's extra reads show up as
     lower GB/s rather than as a different formula, so the columns compare directly.
     """
     names = [*PATHS, "eager"] + (["compile"] if compile_baseline else [])
-    print(f"\nbackward benchmark: M={m}, dtype={dtype}, median ms and GB/s")
+    print(f"\nbackward benchmark: M={m}, dtype={dtype}, mean ms and GB/s")
     header = "  ".join(f"{nm + ' ms':>10} {'GB/s':>6}" for nm in names)
     print(f"{'N':>6}  {header}  default")
     for n in BENCH_WIDTHS:

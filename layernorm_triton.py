@@ -384,15 +384,16 @@ CASES: list[tuple[tuple[int, ...], torch.dtype, float, str]] = [
 
 
 def benchmark(device: str, dtype: torch.dtype = torch.float16, m: int = 4096, compile_baseline: bool = True) -> None:
-    """Print median forward time and effective bandwidth for Triton, eager and torch.compile.
+    """Print mean forward time and effective bandwidth for Triton, eager and torch.compile.
 
-    do_bench handles warmup, cache flushing and repeats. Bandwidth counts one read of x,
+    do_bench handles warmup, cache flushing and repeats, and returns the mean of its timed
+    runs unless asked for another statistic. Bandwidth counts one read of x,
     one write of y, and one read each of weight and bias. The compiled column is
     inductor's own generated kernel for the same shape, the baseline a custom kernel has
     to beat to be worth keeping.
     """
     names = ["triton", "eager"] + (["compile"] if compile_baseline else [])
-    print(f"\nforward benchmark: M={m}, dtype={dtype}, median ms and GB/s")
+    print(f"\nforward benchmark: M={m}, dtype={dtype}, mean ms and GB/s")
     print(f"{'N':>6}  " + "  ".join(f"{nm + ' ms':>10} {'GB/s':>6}" for nm in names))
     for n in BENCH_WIDTHS:
         x, w, b = make_inputs((m, n), dtype, device)

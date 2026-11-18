@@ -430,7 +430,7 @@ def _print_table(
     `rows` is consumed one width at a time. Pass a generator, not a list: each width's
     tensors and its fresh torch.compile cache must exist only while that width is timed.
     """
-    print(f"\n{title}, median ms and GB/s")
+    print(f"\n{title}, mean ms and GB/s")
     print(f"{'N':>6}  " + "  ".join(f"{nm + ' ms':>10} {'GB/s':>6}" for nm in names))
     for n, fns, nbytes in rows:
         cells = []

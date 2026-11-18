@@ -5,7 +5,7 @@ The first LayerNorm sections were measured on Google Colab, November 2026. Every
 - GPU: NVIDIA Tesla T4, 16 GB, about 320 GB/s peak memory bandwidth. The best any kernel here reaches is about 250 GB/s, and that is treated as the practical ceiling.
 - torch 2.14.1+cu130, triton 3.8.0.
 
-All timings use M = 4096 rows, fp16, and the median from `triton.testing.do_bench`. Runs are numbered in the order they happened. The current tables are from run 5, which added the `torch.compile` column (default inductor mode, `dynamic=False`, one compile per width). Earlier runs agreed within noise at every width they shared, except eager at N ≤ 1024, which swings by up to 2x between runs.
+All timings use M = 4096 rows, fp16, and the mean over the timed runs of `triton.testing.do_bench`, which is what it returns by default. Until 2026-11-17 this file and the scripts called these figures medians. That label was wrong; the numbers are unchanged. Runs are numbered in the order they happened. The current tables are from run 5, which added the `torch.compile` column (default inductor mode, `dynamic=False`, one compile per width). Earlier runs agreed within noise at every width they shared, except eager at N ≤ 1024, which swings by up to 2x between runs.
 
 ## Correctness
 
@@ -150,7 +150,7 @@ Everything below ran on Kaggle's "GPU T4 x2" accelerator; the scripts use the fi
 
 - GPU: NVIDIA Tesla T4.
 - torch 2.11.0+cu130, triton 3.6.0. Both are older than the Colab versions above (torch 2.14.1, triton 3.8.0).
-- Timings use M = 4096 rows, fp16, the median from `do_bench`, and one fresh `torch.compile` per width, as in the Colab tables.
+- Timings use M = 4096 rows, fp16, the mean from `do_bench`, and one fresh `torch.compile` per width, as in the Colab tables.
 - The tables are from one job, pushed by `kaggle_run.py run --bench` from a clean tree at commit `7b0c7f8`. The job prints the commit it was built from.
 
 ## LayerNorm on the Kaggle versions

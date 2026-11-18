@@ -2,7 +2,7 @@
 """Register and spill probe for the LayerNorm kernels.
 
 Launches each kernel directly, mirroring the launchers' settings, so the compiled handle
-is available. Prints registers per thread, spill count, median time and bandwidth. A
+is available. Prints registers per thread, spill count, mean time and bandwidth. A
 kernel that spills shows up here before it shows up as a bandwidth cliff in the benchmark.
 The N=16384 fused-backward cliff in RESULTS.md was found this way.
 
