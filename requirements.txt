@@ -1,5 +1,6 @@
-# The versions every check last passed on: a Kaggle Tesla T4 on 2026-11-19, where the
-# torch build was 2.11.0+cu130. Linux only; Triton does not support macOS or Windows.
+# The versions of the last GPU run: a Kaggle Tesla T4 on 2026-11-19, commit 024a1bc, where
+# every check that existed then passed. The torch build there was 2.11.0+cu130. Linux
+# only; Triton does not support macOS or Windows.
 #
 # The LayerNorm benchmark tables at the top of the README came from torch 2.14.1 with
 # triton 3.8.0. Timings differ between the two pairs: see Limits in README.md before
