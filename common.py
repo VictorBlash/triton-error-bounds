@@ -255,3 +255,39 @@ def assert_within_bound(name: str, got: torch.Tensor, ref: torch.Tensor, bound: 
         f"bound={bound.flatten()[worst].item():.3e}"
     )
     return bound_ratio(got, ref, bound)
+
+
+class MutantCase(NamedTuple):
+    """One planted fault, with everything needed to judge it.
+
+    Each mutation test builds its cases once, so the test and probe_tolerances.py judge
+    the same tensors.
+    """
+
+    label: str
+    good: dict[str, torch.Tensor]  # the correct kernels' output on the same input, by path
+    bad: torch.Tensor  # the faulty output
+    eager: torch.Tensor  # PyTorch eager's result, in the kernel's dtype
+    ref: torch.Tensor  # fp64 reference
+    bound: torch.Tensor  # per-element bound on |correct output - ref|
+    atol_scale: int  # the parity check multiplies atol by this: the row count for dw and db, else 1
+
+
+def bound_rejects_mutant(case: MutantCase) -> bool:
+    """Mutation test: the per-element bound must accept the correct outputs and reject the fault.
+
+    The correct kernels are checked on the same input first, so a rejection means the
+    bound saw the fault, not that it is too tight for this input.
+
+    Returns:
+        True if the fixed-tolerance parity check (torch.allclose against eager with
+        parity_tolerances) also caught the fault, False if only the bound did.
+
+    Raises:
+        AssertionError: the bound rejected a correct output or accepted the faulty one.
+    """
+    for path, good in case.good.items():
+        assert_within_bound(f"{case.label}: correct {path} output", good, case.ref, case.bound)
+    assert ((case.bad.double() - case.ref).abs() > case.bound).any(), f"per-element bound accepted mutant: {case.label}"
+    atol, rtol = parity_tolerances(case.bad.dtype)
+    return not torch.allclose(case.bad.double(), case.eager.double(), atol=atol * case.atol_scale, rtol=rtol)

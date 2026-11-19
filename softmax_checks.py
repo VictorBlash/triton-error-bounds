@@ -40,9 +40,11 @@ from common import (
     FP32_MIN_SUBNORMAL,
     U_FP32,
     ULP_REL_FP32,
+    MutantCase,
     add_err,
     assert_close,
     assert_within_bound,
+    bound_rejects_mutant,
     compile_fresh,
     exp_err,
     mean_cell,
@@ -358,8 +360,76 @@ def _mutant_bwd_drop_sum_kernel(dy_ptr, y_ptr, dx_ptr, N, BLOCK_SIZE: tl.constex
     tl.store(dx_ptr + row * N + cols, (y * dy).to(dx_ptr.dtype.element_ty), mask=mask)
 
 
+def no_rescale_case(device: str) -> MutantCase:
+    """Planted fault: an online forward without the rescale, on rows whose max rises in every tile.
+
+    Args:
+        device: device to run on.
+    """
+    m, n = 16, 8192
+    x = make_inputs((m, n), torch.float16, device, kind="ramp")
+    y_ref, bound = softmax_reference_with_bound(x, online_tiles(n))
+    y_bad = torch.empty_like(x)
+    _mutant_online_no_rescale_kernel[(m,)](x, y_bad, n, BLOCK_N=tile_for(n))
+    return MutantCase(
+        label="online forward skips the rescale",
+        good={"online": softmax_triton(x, path="online")},
+        bad=y_bad,
+        eager=softmax_eager(x),
+        ref=y_ref,
+        bound=bound,
+        atol_scale=1,
+    )
+
+
+def dropped_sum_case(device: str, shrink: float = 1.0) -> MutantCase:
+    """Planted fault: a backward without the sum(dy * y) term.
+
+    dy has a nonzero mean and a small spread, so the true dx = y * (dy - s) is near zero
+    while the mutant's y * dy is not. Both are far below atol = 1e-3, so allclose is
+    expected to miss this.
+
+    Args:
+        device: device to run on.
+        shrink: multiplies the upstream gradient, to plant the same fault at a smaller
+            magnitude. The mutation test uses 1.
+    """
+    m, n = 256, 1024
+    x = make_inputs((m, n), torch.float16, device, seed=3)
+    y = softmax_triton(x)
+    g = torch.Generator(device=device).manual_seed(9)
+    dy = (1e-3 * shrink * (1.0 + 0.1 * torch.randn(x.shape, generator=g, device=device))).half()
+    dx_ref, bound = softmax_bwd_reference_with_bound(dy, y)
+    dx_bad = torch.empty_like(y)
+    _mutant_bwd_drop_sum_kernel[(m,)](dy, y, dx_bad, n, BLOCK_SIZE=triton.next_power_of_2(n))
+    xg = x.detach().requires_grad_(True)
+    softmax_eager(xg).backward(dy)
+    return MutantCase(
+        label="backward drops the sum(dy * y) term",
+        good={path: softmax_triton_bwd(dy, y, path=path) for path in BWD_PATHS},
+        bad=dx_bad,
+        eager=xg.grad,
+        ref=dx_ref,
+        bound=bound,
+        atol_scale=1,
+    )
+
+
+def mutant_cases(device: str) -> list[MutantCase]:
+    """Planted faults: two realistic softmax bugs, each on an input where it shows.
+
+    Args:
+        device: device to run on.
+
+    Returns:
+        The forward case, then the backward case. Each carries the correct kernels'
+        output for the same input.
+    """
+    return [no_rescale_case(device), dropped_sum_case(device)]
+
+
 def check_bound_rejects_mutants(device: str) -> dict[str, bool]:
-    """Mutation tests: two realistic softmax bugs must fail the per-element bound.
+    """Mutation tests: every case from mutant_cases must fail the per-element bound.
 
     The correct kernels must pass on the same inputs first, so a rejection means the
     bound saw the bug, not that it is too tight for the input.
@@ -373,37 +443,7 @@ def check_bound_rejects_mutants(device: str) -> dict[str, bool]:
     Raises:
         AssertionError: the correct kernels fail the bound, or a mutant passes it.
     """
-    caught = {}
-    atol, rtol = parity_tolerances(torch.float16)
-
-    # 1. Online forward without the rescale, on rows whose max rises in every tile.
-    m, n = 16, 8192
-    x = make_inputs((m, n), torch.float16, device, kind="ramp")
-    y_ref, bound = softmax_reference_with_bound(x, online_tiles(n))
-    assert_within_bound("online y on ramp input", softmax_triton(x, path="online"), y_ref, bound)
-    y_bad = torch.empty_like(x)
-    _mutant_online_no_rescale_kernel[(m,)](x, y_bad, n, BLOCK_N=tile_for(n))
-    assert ((y_bad.double() - y_ref).abs() > bound).any(), "per-element bound accepted the no-rescale mutant"
-    caught["online forward skips the rescale"] = not torch.allclose(y_bad, softmax_eager(x), atol=atol, rtol=rtol)
-
-    # 2. Backward without the sum term. dy has a nonzero mean and a small spread, so the
-    # true dx = y * (dy - s) is near zero while the mutant's y * dy is not. Both are far
-    # below atol = 1e-3, so allclose is expected to miss this.
-    m, n = 256, 1024
-    x = make_inputs((m, n), torch.float16, device, seed=3)
-    y = softmax_triton(x)
-    g = torch.Generator(device=device).manual_seed(9)
-    dy = (1e-3 * (1.0 + 0.1 * torch.randn(x.shape, generator=g, device=device))).half()
-    dx_ref, bound = softmax_bwd_reference_with_bound(dy, y)
-    for path in BWD_PATHS:
-        assert_within_bound(f"{path} dx with small dy", softmax_triton_bwd(dy, y, path=path), dx_ref, bound)
-    dx_bad = torch.empty_like(y)
-    _mutant_bwd_drop_sum_kernel[(m,)](dy, y, dx_bad, n, BLOCK_SIZE=triton.next_power_of_2(n))
-    assert ((dx_bad.double() - dx_ref).abs() > bound).any(), "per-element bound accepted the dropped-sum mutant"
-    xg = x.detach().requires_grad_(True)
-    softmax_eager(xg).backward(dy)
-    caught["backward drops the sum(dy * y) term"] = not torch.allclose(dx_bad, xg.grad, atol=atol, rtol=rtol)
-    return caught
+    return {case.label: bound_rejects_mutant(case) for case in mutant_cases(device)}
 
 
 # ---------------------------------------------------------------------------

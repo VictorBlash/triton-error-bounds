@@ -33,9 +33,11 @@ import triton.language as tl
 
 from common import (
     U_FP32,
+    MutantCase,
     add_err,
     assert_close,
     assert_within_bound,
+    bound_rejects_mutant,
     compile_fresh,
     gamma,
     mean_cell,
@@ -149,7 +151,7 @@ def layer_norm_bwd_reference_with_bound(
 # ---------------------------------------------------------------------------
 
 
-def _eager_grads(dy: torch.Tensor, x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, eps: float) -> Grads:
+def eager_grads(dy: torch.Tensor, x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, eps: float) -> Grads:
     """Gradients from PyTorch eager autograd, in the input dtype."""
     xg = x.detach().requires_grad_(True)
     wg = weight.detach().requires_grad_(True)
@@ -215,7 +217,7 @@ def check_backward(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, ep
     """
     g = torch.Generator(device=x.device).manual_seed(7)
     dy = torch.randn(x.shape, generator=g, device=x.device).to(x.dtype)
-    want_eager = _eager_grads(dy, x, weight, bias, eps)
+    want_eager = eager_grads(dy, x, weight, bias, eps)
     want_fp64 = layer_norm_bwd_reference_with_bound(dy, x, weight, eps)
     got = {path: _check_path(path, dy, x, weight, bias, eps, want_eager, want_fp64) for path in PATHS}
 
@@ -247,8 +249,8 @@ def _mutant_dx_drop_c1_kernel(dy_ptr, w_ptr, rstd_ptr, dx_ptr, N, BLOCK_SIZE: tl
     tl.store(dx_ptr + row * N + cols, dx.to(dx_ptr.dtype.element_ty), mask=mask)
 
 
-def check_bound_rejects_mutants(device: str) -> dict[str, bool]:
-    """Mutation tests: two realistic backward bugs must fail the per-element bound.
+def mutant_cases(device: str, shrink: float = 1.0) -> list[MutantCase]:
+    """Planted faults: two realistic backward bugs, as three faulty outputs.
 
     Both run real kernels on gradients of size ~1e-3, typical late in training. At that
     scale a fixed atol of 1e-3 is as large as the gradients themselves, so allclose is
@@ -257,6 +259,43 @@ def check_bound_rejects_mutants(device: str) -> dict[str, bool]:
     Mutants:
       - a dx kernel that drops the xhat * mean(wdy * xhat) term,
       - dw and db with an off-by-one that skips the last row.
+
+    Args:
+        device: device to run on.
+        shrink: multiplies the upstream gradient, to plant the same faults at a smaller
+            magnitude. The mutation test uses 1.
+
+    Returns:
+        One case each for dx, dw and db. Each carries every path's correct output for
+        the same input.
+    """
+    m, n = 256, 1024
+    x, w, b = make_inputs((m, n), torch.float16, device, seed=3)
+    g = torch.Generator(device=device).manual_seed(9)
+    dy = (1e-3 * shrink * torch.randn(x.shape, generator=g, device=device)).half()
+    _, mean, rstd = layer_norm_triton_fwd(x, w, b)
+    refs, bounds = layer_norm_bwd_reference_with_bound(dy, x, w)
+    good = {path: layer_norm_triton_bwd(dy, x, w, mean, rstd, path=path) for path in PATHS}
+
+    dx_bad = torch.empty_like(x)
+    _mutant_dx_drop_c1_kernel[(m,)](dy, w, rstd, dx_bad, n, BLOCK_SIZE=triton.next_power_of_2(n))
+    _, dw_bad, db_bad = layer_norm_triton_bwd(dy[:-1], x[:-1], w, mean[:-1], rstd[:-1], path="split")
+
+    eager = eager_grads(dy, x, w, b, EPS)
+    # dw and db are sums over the m rows, so the parity check scales atol by m for them.
+    mutants = (
+        ("dx drops the c1 term", dx_bad, 1),
+        ("dw skips the last row", dw_bad, m),
+        ("db skips the last row", db_bad, m),
+    )
+    return [
+        MutantCase(label, {path: grads[i] for path, grads in good.items()}, bad, eager[i], refs[i], bounds[i], scale)
+        for i, (label, bad, scale) in enumerate(mutants)
+    ]
+
+
+def check_bound_rejects_mutants(device: str) -> dict[str, bool]:
+    """Mutation tests: every case from mutant_cases must fail the per-element bound.
 
     The correct kernels must pass on the same input first, so a rejection means the bound
     saw the bug, not that it is too tight for small gradients.
@@ -270,34 +309,7 @@ def check_bound_rejects_mutants(device: str) -> dict[str, bool]:
     Raises:
         AssertionError: the correct kernels fail the bound, or a mutant passes it.
     """
-    m, n = 256, 1024
-    x, w, b = make_inputs((m, n), torch.float16, device, seed=3)
-    g = torch.Generator(device=device).manual_seed(9)
-    dy = (1e-3 * torch.randn(x.shape, generator=g, device=device)).half()
-    _, mean, rstd = layer_norm_triton_fwd(x, w, b)
-    refs, bounds = layer_norm_bwd_reference_with_bound(dy, x, w)
-
-    for path in PATHS:
-        got = layer_norm_triton_bwd(dy, x, w, mean, rstd, path=path)
-        for name, gt, r, bd in zip(("dx", "dw", "db"), got, refs, bounds, strict=True):
-            assert_within_bound(f"{path} {name} with small dy", gt, r, bd)
-
-    dx_bad = torch.empty_like(x)
-    _mutant_dx_drop_c1_kernel[(m,)](dy, w, rstd, dx_bad, n, BLOCK_SIZE=triton.next_power_of_2(n))
-    _, dw_bad, db_bad = layer_norm_triton_bwd(dy[:-1], x[:-1], w, mean[:-1], rstd[:-1], path="split")
-
-    eager = _eager_grads(dy, x, w, b, EPS)
-    atol, rtol = parity_tolerances(torch.float16)
-    mutants = (
-        ("dx drops the c1 term", dx_bad, 0, atol),
-        ("dw skips the last row", dw_bad, 1, atol * m),
-        ("db skips the last row", db_bad, 2, atol * m),
-    )
-    caught = {}
-    for label, bad, i, a in mutants:
-        assert ((bad.double() - refs[i]).abs() > bounds[i]).any(), f"per-element bound accepted mutant: {label}"
-        caught[label] = not torch.allclose(bad.double(), eager[i].double(), atol=a, rtol=rtol)
-    return caught
+    return {case.label: bound_rejects_mutant(case) for case in mutant_cases(device)}
 
 
 # ---------------------------------------------------------------------------

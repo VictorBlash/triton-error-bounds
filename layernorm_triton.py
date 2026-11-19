@@ -38,7 +38,9 @@ from common import (
     U_FP32,
     ULP_REL_FP32,
     UNIT_ROUNDOFF,
+    MutantCase,
     add_err,
+    bound_rejects_mutant,
     compile_fresh,
     mean_cell,
     mean_err,
@@ -326,11 +328,38 @@ def check_kernel(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, eps:
         assert torch.equal(single, y_rows[i : i + 1]), f"row {i} differs when launched alone"
 
 
+def dropped_bias_case(device: str, shrink: float = 1.0) -> MutantCase:
+    """Planted fault: the forward kernel run with a zero bias where the input has a small one.
+
+    Bias values stay under 1e-3, so the fixed allclose tolerance is expected to miss the fault.
+
+    Args:
+        device: device to run on.
+        shrink: multiplies the bias, to plant the same fault at a smaller magnitude. The
+            mutation test uses 1.
+    """
+    g = torch.Generator(device=device).manual_seed(1)
+    n = 1024
+    x = torch.randn(256, n, generator=g, device=device).half()
+    w = (1.0 + 0.1 * torch.randn(n, generator=g, device=device)).half()
+    b = (3e-4 * shrink * torch.randn(n, generator=g, device=device)).clamp(-9e-4 * shrink, 9e-4 * shrink).half()
+
+    y_ref, bound = layer_norm_reference_with_bound(x, w, b)
+    return MutantCase(
+        label="forward drops the bias",
+        good={"forward": layer_norm_triton(x, w, b)},
+        bad=layer_norm_triton(x, w, torch.zeros_like(b)),
+        eager=layer_norm_eager(x, w, b),
+        ref=y_ref,
+        bound=bound,
+        atol_scale=1,
+    )
+
+
 def check_oracle_rejects_dropped_bias(device: str) -> bool:
     """Mutation test: a kernel that ignores a small bias must fail the per-element bound.
 
-    If this test passed for a broken kernel, check 2 would be worthless. Bias values stay
-    under 1e-3, so the fixed allclose tolerance is expected to miss the fault.
+    If this test passed for a broken kernel, check 2 would be worthless.
 
     Args:
         device: device to run on.
@@ -339,20 +368,10 @@ def check_oracle_rejects_dropped_bias(device: str) -> bool:
         True if allclose also caught the fault, False if only the per-element bound did.
 
     Raises:
-        AssertionError: the per-element bound accepted the faulty output.
+        AssertionError: the per-element bound rejected the correct kernel's output on
+            this input, or accepted the faulty one.
     """
-    g = torch.Generator(device=device).manual_seed(1)
-    n = 1024
-    x = torch.randn(256, n, generator=g, device=device).half()
-    w = (1.0 + 0.1 * torch.randn(n, generator=g, device=device)).half()
-    b = (3e-4 * torch.randn(n, generator=g, device=device)).clamp(-9e-4, 9e-4).half()
-
-    mutant = layer_norm_triton(x, w, torch.zeros_like(b))
-    y_ref, bound = layer_norm_reference_with_bound(x, w, b)
-    assert ((mutant.double() - y_ref).abs() > bound).any(), "per-element bound accepted a kernel that drops the bias"
-
-    atol, rtol = parity_tolerances(torch.float16)
-    return not torch.allclose(mutant, layer_norm_eager(x, w, b), atol=atol, rtol=rtol)
+    return bound_rejects_mutant(dropped_bias_case(device))
 
 
 def make_inputs(
