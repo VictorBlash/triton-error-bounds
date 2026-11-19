@@ -11,7 +11,7 @@ Measured on a Tesla T4 (Google Colab), M = 4096 rows, fp16, against eager `F.lay
 
 The eager comparison flatters the forward: inductor's generated forward kernel matches or beats this one at common hidden sizes. The backward is where the custom kernel earns its place. Full tables, the register-spill investigation, a retracted measurement and the reasons behind every tuning constant are in [RESULTS.md](RESULTS.md).
 
-The repo also has a softmax built on the same error model, with an online forward and a tiled backward for rows too wide for one block. Measured on a Tesla T4 (Kaggle, older torch and triton than the Colab runs), same M and dtype, two runs that agree:
+The repo also has a softmax built on the same error model, with an online forward and a tiled backward for rows too wide for one block. Measured on a Tesla T4 (Kaggle, older torch and triton than the Colab runs), same M and dtype, three runs; two baseline columns moved between them (see Limits):
 
 | | vs eager PyTorch | vs torch.compile | Bandwidth |
 |:---|:---|:---|:---|
@@ -52,7 +52,7 @@ LayerNorm kernels are a Triton tutorial. The verification is the point of this r
 
 ## Running
 
-Needs a CUDA GPU with PyTorch and Triton. The LayerNorm results were produced on a free Colab T4 and the softmax results on a free Kaggle T4. Upload every `.py` file: all the scripts import `common.py`.
+Needs a CUDA GPU with PyTorch and Triton. Nothing is pinned. The LayerNorm results were produced on a free Colab T4 (torch 2.14.1, triton 3.8.0) and the softmax results on a free Kaggle T4 (torch 2.11.0, triton 3.6.0). Upload every `.py` file: all the scripts import `common.py`.
 
 ```
 python layernorm_triton.py --skip-bench       # forward checks, about a minute
@@ -98,3 +98,7 @@ y = layer_norm_autograd(x, weight, bias)   # x: fp16 or bf16 CUDA tensor of shap
 - The approximate-math budgets were measured on one GPU model and one Triton version. Run `probe_math.py` before trusting the bounds on another.
 - The training-loop check is one small model: LayerNorm at width 256, softmax at width 64, fp16, 300 steps, one seed, contiguous tensors. It shows the wrappers are drop-in there. It does not time them, and it does not cover bf16 or the wide rows the benchmarks use.
 - The LayerNorm bound assumes no fp32 overflow or underflow. Both bounds assume approximate sqrt, division and exp stay within stated ulp budgets; the constants are in `common.py`.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
