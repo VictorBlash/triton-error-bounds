@@ -26,8 +26,8 @@ Both autograd wrappers were then put inside a model. `train_check.py` trains a s
 
 LayerNorm kernels are a Triton tutorial. The verification is the point of this repo.
 
-- **Per-element error bound instead of `atol`/`rtol`.** A fixed tolerance is too loose near zero and too tight for large values, so it both misses bugs and raises false alarms. Following "Beyond atol and rtol" (arXiv 2610.38983), the checks derive an acceptance region for every output element from a rounding-error model of the kernel's own arithmetic, and compare against an fp64 reference. One error model covers the forward and both backward paths.
-- **Mutation tests prove the bound has teeth.** Deliberately broken kernels (a dropped bias, a dropped gradient term, a reduction that skips a row, an online softmax that never rescales its running sum) run on inputs chosen so that the damage is small, about 1e-3 or less. The bound rejects all of them. The fixed-tolerance check these scripts also run, `torch.allclose` with atol = rtol = 1e-3, passes all of them: at that scale the tolerance is as large as the values it checks. That result is about this tolerance on these inputs. A tighter fixed tolerance has not been measured against the same faults.
+- **Per-element error bound instead of `atol`/`rtol`.** A fixed tolerance fits one magnitude: an `atol` large enough to accept correct results near zero hides faults smaller than itself, and without one, correct results near zero are rejected. Following "Beyond atol and rtol" (arXiv 2610.38983), the checks derive an acceptance region for every output element from a rounding-error model of the kernel's own arithmetic, and compare against an fp64 reference. One error model covers the forward and both backward paths.
+- **Mutation tests, and what they do and do not show.** Deliberately broken kernels (a dropped bias, a dropped gradient term, a reduction that skips a row, an online softmax that never rescales its running sum) run on inputs chosen so that the damage is small, about 1e-3 or less. The bound rejects all six faulty outputs. The fixed-tolerance check these scripts also run, `torch.allclose` with atol = rtol = 1e-3, accepts all six. That is this repo's tolerance being too loose, not a limit of fixed tolerances: `probe_tolerances.py` measured the defaults of `torch.testing.assert_close` (rtol 1e-3, atol 1e-5 for fp16) against an fp64 reference rejecting all six too, while accepting every correct output. The bound pulls ahead when the same faults are planted on smaller values. At a tenth of the magnitude the default tolerance accepts one fault of five and at a hundredth three of five; the bound accepts none and one. Dropping `atol` instead rejects about a third of the correct outputs. The table and the bound's own blind spot are in RESULTS.md under "Fixed tolerances against the bound".
 - **Determinism and batch invariance.** No atomics. Two launches are bitwise equal, and a row's output does not depend on which other rows share its batch. The checks assert both.
 - **Measured, not assumed.** The backward switches between two kernel layouts at N = 16384 because the fused kernel was measured spilling registers there. A third layout designed to fix a predicted spill at N = 32768 was measured slower and removed; its numbers stay in RESULTS.md. `probe_spills.py` reports registers, spills and time per kernel so the next change can be measured the same way.
 - **Not built, on evidence.** A fused attention kernel was the obvious next step. A go/no-go probe measured a prototype at a tenth of PyTorch's speed on the T4, because Triton cannot use tensor cores below compute capability 8.0. The kernel was not built; the probe and its numbers are kept.
@@ -45,6 +45,8 @@ LayerNorm kernels are a Triton tutorial. The verification is the point of this r
 | `softmax_checks.py` | Softmax error bound, checks, mutation tests, benchmark |
 | `probe_math.py` | The GPU's fp32 exp, division and 1 / sqrt error in ulps, against the budgets the bounds assume |
 | `probe_attention.py` | Go / no-go probe for a fused attention forward: a prototype against PyTorch's attention |
+| `probe_tolerances.py` | Fixed tolerances against the per-element bound: which accept every correct output and reject every planted fault |
+| `emulation.py` | fp32 torch stand-ins for every kernel launch, so the probe and the mutation tests can be rehearsed on a CPU |
 | `softmax_cpu_check.py` | The softmax error bound against an fp32 emulation of the kernels; runs without a GPU or Triton |
 | `train_check.py` | Training-loop check: a small transformer trained through both autograd wrappers, against PyTorch's operations, with mutation tests |
 | `kaggle_run.py` | Runs the checks or benchmarks on a Kaggle T4 from the command line and returns the result |
@@ -64,6 +66,8 @@ python softmax_checks.py                      # checks plus both softmax benchma
 python probe_spills.py --n 16384 32768        # registers and spills per kernel
 python probe_math.py                          # exp, division and 1/sqrt error against the budgets
 python probe_attention.py                     # is a fused attention kernel worth building on this GPU?
+python probe_tolerances.py                    # which fixed tolerances do the job of the per-element bound?
+python probe_tolerances.py --emulate          # the same script on the CPU, without Triton: tests the script
 python softmax_cpu_check.py                   # error-model check, no GPU needed
 python train_check.py                         # train a small model through both autograd wrappers
 python train_check.py --emulate               # the same script on the CPU, without Triton: tests the script

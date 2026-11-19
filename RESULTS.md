@@ -21,7 +21,7 @@ Both scripts pass every check on the T4.
 | dw skips the last row | rejected | missed |
 | db skips the last row | rejected | missed |
 
-At gradients near 1e-3, a fixed `atol` of 1e-3 is as large as the values it checks, so it cannot see errors of that size. The per-element bound scales with the values.
+At gradients near 1e-3, a fixed `atol` of 1e-3 is as large as the values it checks, so it cannot see errors of that size. The per-element bound scales with the values. A tighter fixed tolerance does catch these faults at this magnitude; "Fixed tolerances against the bound" below measures which ones and where they stop.
 
 The bound runs use the corrected error model: an earlier version counted the 4-ulp sqrt and division allowance as 4 × 2^-24, which is 2 ulps.
 
@@ -388,6 +388,49 @@ How the limit was set. `python train_check.py --emulate` runs emulate against to
 
 Limits of this check: one small model, one seed, 300 steps, fp16 only, widths 256 and 64, and every tensor the wrappers received was contiguous. It does not time anything, so it says nothing about training speed. bf16 and the wide rows of the benchmarks are covered by the kernel checks only.
 
+## Fixed tolerances against the bound
+
+Question: the mutation tests show the bound rejecting faults that `allclose` accepts at atol = rtol = 1e-3. That tolerance is this repo's own choice, and the faults are planted on small values. Would another fixed tolerance do the bound's job?
+
+Method: `probe_tolerances.py` on the Kaggle T4, torch 2.11.0, triton 3.6.0, commit `024a1bc`, 2026-11-19. A check does the job only if it accepts every correct kernel output and rejects every planted fault. The correct outputs are the 113 that the kernels produce on the regular cases of the three check scripts (every shape, dtype and path) and the 10 they produce on the mutation-test inputs. The faults are the six faulty outputs of the mutation tests. Each fixed tolerance accepts an element when |got - want| ≤ atol + rtol × |want|, and is measured against two references: PyTorch eager in the kernel's dtype, which the scripts' parity check compares with, and the fp64 reference the bound uses. Values are for fp16; bf16 uses 8e-3 in the first row and rtol 1.6e-2 in the next two.
+
+| Check | atol | rtol | Reference | Correct outputs accepted | Faults rejected |
+|:---|---:|---:|:---|---:|---:|
+| This repo's parity check | 1e-3 (× rows for dw, db) | 1e-3 | eager | 123 of 123 | 0 of 6 |
+| | | | fp64 | 123 of 123 | 0 of 6 |
+| `torch.testing.assert_close` defaults | 1e-5 | 1e-3 | eager | 117 of 123 | 6 of 6 |
+| | | | fp64 | 123 of 123 | 6 of 6 |
+| The same rtol without atol | 0 | 1e-3 | eager | 88 of 123 | 6 of 6 |
+| | | | fp64 | 80 of 123 | 6 of 6 |
+| `torch.allclose` defaults | 1e-8 | 1e-5 | eager | 63 of 123 | 6 of 6 |
+| | | | fp64 | 13 of 123 | 6 of 6 |
+| Per-element bound | | | fp64 | 123 of 123 | 6 of 6 |
+
+A fixed atol is a statement about one magnitude, so the probe then plants the faults again at 0.1 and 0.01 of the mutation tests' magnitude (upstream gradients of 1e-4 and 1e-5 where the tests use 1e-3, bias values up to 9e-5 and 9e-6 where the tests use 9e-4), with the correct kernels run on the same inputs. The online softmax forward fault has no magnitude to set and is left out there. The table gives the faulty output's largest error over what the check allows, for the `assert_close` defaults against fp64 and for the bound. Above 1 the fault is rejected; **bold** marks a fault the check accepted.
+
+| Fault | Magnitude 1: tolerance | bound | 0.1: tolerance | bound | 0.01: tolerance | bound |
+|:---|---:|---:|---:|---:|---:|---:|
+| LayerNorm forward drops the bias | 84.5 | 21.4 | 8.22 | 2.16 | **0.82** | **0.84** |
+| LayerNorm dx drops the `xhat * mean(wdy * xhat)` term | 29.9 | 546 | 3.12 | 329 | **0.31** | 82 |
+| LayerNorm dw skips the last row | 300 | 145 | 40.8 | 144 | 4.77 | 133 |
+| LayerNorm db skips the last row | 256 | 821 | 29.7 | 765 | 3.02 | 456 |
+| Softmax online forward skips the rescale | 43.7 | 486 | - | - | - | - |
+| Softmax backward drops the `sum(dy * y)` term | 5.92 | 1620 | **0.59** | 194 | **0.06** | 20.2 |
+| Faults rejected | 6 of 6 | 6 of 6 | 4 of 5 | 5 of 5 | 2 of 5 | 4 of 5 |
+
+At both smaller magnitudes the `assert_close` defaults and the bound accepted all 9 correct outputs on those inputs. Against eager the tolerance's verdicts on the faults are the same as against fp64.
+
+1. The earlier claim was about this repo's tolerance. At atol = rtol = 1e-3 `allclose` accepts all six faults against either reference; the largest faulty error is 0.90 of what it allows. That is a tolerance chosen too loose, not a limit of fixed tolerances.
+2. At the magnitude the mutation tests use, the defaults of `torch.testing.assert_close` against the fp64 reference do the whole job: every correct output accepted, the worst using 0.49 of the allowance, and every fault rejected, by 5.9 to 300 times the allowance. On these six faults the bound shows no advantage over that check. For two of them, the dropped bias and dw, the fixed tolerance rejects by the wider margin.
+3. Against eager in the kernel's dtype the same tolerance rejects 6 of the 123 correct outputs: softmax dx on (17, 7) fp16, (64, 127) bf16 and the wide-spread (64, 1024) case, on both paths, by up to 2.2 times the allowance. The kernels are inside their bound against fp64 on those cases, so these are false alarms. A tolerance this tight needs a reference more accurate than the fp16 eager result.
+4. Dropping atol rejects every fault and 35 to 43 of the 123 correct outputs. Near zero a relative tolerance allows almost nothing, and fp16 rounding or fp32 cancellation is larger than that. The `allclose` defaults are tighter than fp16 rounding and reject 60 to 110.
+5. The bound's advantage appears when the values shrink. At 0.1 of the magnitude the `assert_close` defaults accept one fault of five, the softmax backward, at 0.59 of the allowance. At 0.01 they accept three of five. The bound rejects all five at 0.1 and four of five at 0.01, with margins of 20 to 765 on the ones it rejects apart from the bias.
+6. The bound is not the stronger check everywhere. It accepts the dropped bias at 0.01: the fault changed 1.8% of the elements and every one stayed inside its bound, and at 0.1 it rejects that fault by only 2.2. The cause is the bound's own slack. Computed from the error model on the CPU for the same input recipe, the LayerNorm forward bound for outputs with |y| < 1e-2 at N = 1024 has a median of 5.1e-5, about 20 times fp16 rounding there (2.5e-6), because it allows any summation order for the row statistics. A bias below that floor cannot be seen. A bound that modeled the kernel's actual reduction order would be tighter.
+
+Limits: six faults, chosen by the author, on inputs chosen to make them small; they are not a sample of real bugs and the counts are not rates. One GPU, one torch and Triton version, one seed. The fp64 reference for softmax dx is computed from the kernel's own y, so the eager column there also contains the difference between the two forwards. At 0.01 the planted gradients are about 1e-5, which is subnormal in fp16; mixed-precision training normally scales the loss to stay out of that range, so the 0.1 row is the more realistic one. The eager columns describe PyTorch's fp16 implementation on this GPU and version.
+
+The mutation tests were restructured for this probe so that both judge the same tensors (`MutantCase` in `common.py`). The forward test now also requires the correct kernel to pass the bound on its own input, which the other five already did; it does, at 0.83 of the bound. `probe_tolerances.py --emulate` runs the probe on a CPU with fp32 torch arithmetic in place of the kernels (`emulation.py`). It tests the script, not the kernels, and none of the numbers above come from it except the two CPU figures in finding 6.
+
 ## Fused attention: measured, not built
 
 Question: can a fused Triton attention forward beat PyTorch on this GPU? A fused kernel never writes the L x L score matrix to memory. But it has to do both matrix products itself, and Triton lowers `tl.dot` to plain fp32 multiply-adds below compute capability 8.0 (`lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp`: "Dot op using MMA for compute capability ... has been deprecated. It falls back to the FMA path"; the same text in 3.6.0 and 3.8.0). The T4 is 7.5. PyTorch's matmul uses the T4's tensor cores.
@@ -413,6 +456,8 @@ Limits of the verdict: one head dimension, non-causal, six hand-picked settings 
 
 ## Open items
 
+- At the magnitude the mutation tests use, the per-element bound shows no advantage over the defaults of `torch.testing.assert_close` against an fp64 reference: both accept every correct output and reject all six planted faults. The bound pulls ahead only when the same faults are planted on smaller values. That rests on six faults chosen by the author, one GPU and one seed. No fault that a well-chosen fixed tolerance misses at ordinary magnitudes has been shown here.
+- The LayerNorm forward bound allows any summation order for the row statistics, which leaves a floor of about 5e-5 for outputs near zero at N = 1024, 20 times fp16 rounding. It accepted a dropped bias of up to 9e-6. Modeling the kernel's actual reduction order would tighten it; that has not been done.
 - The approximate-math budgets rest on a measurement on one GPU model and one Triton version, not on a documented guarantee: Triton's exp is slightly outside NVIDIA's documented `__expf` bound. `kaggle_run.py run` runs `probe_math.py` before the checks, so a new Triton version or GPU that uses more of a budget shows up there first. Run it before trusting the bounds anywhere else.
 - The backward numbers at N = 32768 assume Triton 3.8.0 or later. On 3.6.0 and 3.7.1 the dx kernel spills more and the split backward is 9 to 12% slower there. The Triton change responsible, somewhere between 3.7.1 and 3.8.0 in the code it generates, was not identified.
 - The LayerNorm benchmark tables on the Kaggle versions are from one run, reproduced once (45 of 49 cells within 3%). The forward at N = 32768 varies by about 5% between samples on one GPU.
