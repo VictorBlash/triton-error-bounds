@@ -1,0 +1,44 @@
+# The linter and the CPU checks. GitHub's hosted runners have no GPU, so no Triton kernel
+# runs here: this tests the error model and the scripts. The kernels are tested only by a
+# GPU run (README.md, Running).
+name: CPU checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cpu-checks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cpu:
+    name: lint and CPU checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      # Actions are pinned to a commit, not a tag: a tag can be moved to different code.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - name: Install ruff and CPU PyTorch
+        # The CPU build of the torch version in requirements.txt. Triton is not installed:
+        # the scripts below register a stand-in for it.
+        run: |
+          python -m pip install ruff==0.17.6
+          python -m pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cpu
+      - name: Lint
+        run: ruff check .
+      - name: Softmax error model against an fp32 emulation of the kernels
+        run: python softmax_cpu_check.py
+      - name: Tolerance probe on emulated kernels
+        run: python probe_tolerances.py --emulate
+      - name: Training-loop check on emulated kernels
+        run: python train_check.py --emulate
