@@ -12,8 +12,8 @@ All timings use M = 4096 rows, fp16, and the mean over the timed runs of `triton
 Both scripts pass every check on the T4.
 
 - `layernorm_triton.py`: 9 shapes plus the mutation test. A fixed-tolerance `allclose` missed the dropped-bias mutant; the per-element bound caught it.
-- `layernorm_bwd_checks.py`: 9 shapes on every backward path (fused, split, tiled), each checked against eager with `allclose` and against fp64 with the per-element bound for dx, dw and db, plus determinism and batch invariance of dx.
-- Backward mutation tests, run on real kernels with gradients of size about 1e-3. The correct kernels passed the bound on the same input first. The bound rejected all three mutants and `allclose` missed all three:
+- `layernorm_bwd_checks.py`: 9 shapes on every backward path (fused and split in the current code; the tiled path of run 3 has been removed, see "The tiled experiment"), each checked against eager with `allclose` and against fp64 with the per-element bound for dx, dw and db, plus determinism and batch invariance of dx.
+- Backward mutation tests, run on real kernels with gradients of size about 1e-3. The correct kernels passed the bound on the same input first. The bound rejected all three mutants. The fixed-tolerance `allclose` (atol = rtol = 1e-3, with atol multiplied by the row count, 256, for dw and db) missed all three:
 
 | Mutant | Per-element bound | `allclose` |
 |:---|:---|:---|
@@ -221,7 +221,7 @@ The tables are the second of two runs on this environment. The first, a day earl
 
 - 13 shapes, each on every path that fits: block and online forward, block and tiled backward. N = 40000 is above the single-block limit and runs on the online and tiled paths only. N = 1 passes on the online path, where the tile is one element wide.
 - Each forward output and each dx is checked for finite values, against eager with `allclose`, and against fp64 with the per-element bound. Two launches must be bitwise equal, and a row launched alone must equal the same row from the batch.
-- Mutation tests on real kernels. The bound rejected both mutants and `allclose` missed both:
+- Mutation tests on real kernels. The bound rejected both mutants and `allclose` at atol = rtol = 1e-3 missed both:
 
 | Mutant | Per-element bound | `allclose` |
 |:---|:---|:---|

@@ -1,6 +1,6 @@
 # Triton error bounds
 
-LayerNorm and softmax kernels, forward and backward, in [Triton](https://github.com/triton-lang/triton), with a correctness check that is stricter than `torch.allclose` and every performance claim measured and recorded.
+LayerNorm and softmax kernels, forward and backward, in [Triton](https://github.com/triton-lang/triton), with a correctness check that gives every output element its own error bound, and every performance claim measured and recorded.
 
 LayerNorm, measured on a Tesla T4 (Google Colab), M = 4096 rows, fp16, against eager `F.layer_norm` and `torch.compile`:
 
@@ -27,7 +27,7 @@ Both autograd wrappers were then put inside a model. `train_check.py` trains a s
 LayerNorm kernels are a Triton tutorial. The verification is the point of this repo.
 
 - **Per-element error bound instead of `atol`/`rtol`.** A fixed tolerance is too loose near zero and too tight for large values, so it both misses bugs and raises false alarms. Following "Beyond atol and rtol" (arXiv 2610.38983), the checks derive an acceptance region for every output element from a rounding-error model of the kernel's own arithmetic, and compare against an fp64 reference. One error model covers the forward and both backward paths.
-- **Mutation tests prove the bound has teeth.** Deliberately broken kernels (a dropped bias, a dropped gradient term, an off-by-one in the reduction) run against the same checks. The bound rejects all of them. `allclose` misses all of them.
+- **Mutation tests prove the bound has teeth.** Deliberately broken kernels (a dropped bias, a dropped gradient term, a reduction that skips a row, an online softmax that never rescales its running sum) run on inputs chosen so that the damage is small, about 1e-3 or less. The bound rejects all of them. The fixed-tolerance check these scripts also run, `torch.allclose` with atol = rtol = 1e-3, passes all of them: at that scale the tolerance is as large as the values it checks. That result is about this tolerance on these inputs. A tighter fixed tolerance has not been measured against the same faults.
 - **Determinism and batch invariance.** No atomics. Two launches are bitwise equal, and a row's output does not depend on which other rows share its batch. The checks assert both.
 - **Measured, not assumed.** The backward switches between two kernel layouts at N = 16384 because the fused kernel was measured spilling registers there. A third layout designed to fix a predicted spill at N = 32768 was measured slower and removed; its numbers stay in RESULTS.md. `probe_spills.py` reports registers, spills and time per kernel so the next change can be measured the same way.
 - **Not built, on evidence.** A fused attention kernel was the obvious next step. A go/no-go probe measured a prototype at a tenth of PyTorch's speed on the T4, because Triton cannot use tensor cores below compute capability 8.0. The kernel was not built; the probe and its numbers are kept.
