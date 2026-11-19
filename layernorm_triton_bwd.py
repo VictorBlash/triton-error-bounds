@@ -382,7 +382,8 @@ def layer_norm_triton_bwd(
         return torch.empty_like(x), zeros, zeros.clone()
 
     impl = _IMPL[path or default_path(x.shape[-1])]
-    dx, dw, db = impl(dy_rows, x_rows, weight.contiguous(), mean, rstd, block_size)
+    # The kernels index weight, mean and rstd as packed arrays, so a strided one is copied first.
+    dx, dw, db = impl(dy_rows, x_rows, weight.contiguous(), mean.contiguous(), rstd.contiguous(), block_size)
     return dx.reshape(x.shape), dw.to(weight.dtype), db.to(weight.dtype)
 
 
