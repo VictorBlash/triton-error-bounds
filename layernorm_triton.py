@@ -40,6 +40,7 @@ from common import (
     UNIT_ROUNDOFF,
     MutantCase,
     add_err,
+    assert_same_bits,
     bound_rejects_mutant,
     compile_fresh,
     mean_cell,
@@ -418,9 +419,9 @@ def check_strided_inputs(device: str) -> None:
     m, n = 6, 1000
     base, w2, b2 = make_inputs((2 * m, 2 * n), torch.float16, device)
     w, b = w2[::2], b2[::2]
-    for name, x in strided_views(base).items():
+    for name, x in strided_views(base, m, n).items():
         want = layer_norm_triton(x.contiguous(), w.contiguous(), b.contiguous())
-        assert torch.equal(layer_norm_triton(x, w, b), want), f"{name}: output differs from the contiguous copy's"
+        assert_same_bits(f"{name} view against its contiguous copy", layer_norm_triton(x, w, b), want)
 
 
 def check_non_finite_rows(device: str) -> None:

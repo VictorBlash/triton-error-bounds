@@ -9,7 +9,7 @@ This tests the scripts, not the kernels. CPU math is correctly rounded, the stan
 in torch's order, and the eager stand-ins compute in fp32 and round once, which is not
 what PyTorch does with fp16 on a GPU. Only a GPU run says anything about the kernels.
 
-Used by probe_tolerances.py --emulate.
+Used by probe_tolerances.py --emulate and layout_cpu_check.py.
 """
 
 from __future__ import annotations

@@ -43,6 +43,7 @@ from common import (
     MutantCase,
     add_err,
     assert_close,
+    assert_same_bits,
     assert_within_bound,
     bound_rejects_mutant,
     compile_fresh,
@@ -462,16 +463,19 @@ def check_strided_inputs(device: str) -> None:
     Raises:
         AssertionError: an output from the views differs from the contiguous copies'.
     """
-    m, n = 6, 1000  # 1000 fits one block, so both paths of each direction run
-    xs = strided_views(make_inputs((2 * m, 2 * n), torch.float16, device))
-    dys = strided_views(make_inputs((2 * m, 2 * n), torch.float16, device, seed=7))
+    m, n = 6, 5000  # fits one block, and is two column tiles for the online and tiled kernels
+    xs = strided_views(make_inputs((2 * m, 2 * n), torch.float16, device), m, n)
+    # dy comes from a wider tensor than y, so the two "every other row" views have different
+    # row strides and a launcher that passed one in place of the other is caught.
+    dys = strided_views(make_inputs((2 * m, 3 * n), torch.float16, device, seed=7), m, n)
     for (name, x), dy in zip(xs.items(), dys.values(), strict=True):
         for path in FWD_PATHS:
-            want = softmax_triton(x.contiguous(), path=path)
-            assert torch.equal(softmax_triton(x, path=path), want), f"{path}: y for the {name} view differs"
+            got, want = softmax_triton(x, path=path), softmax_triton(x.contiguous(), path=path)
+            assert_same_bits(f"{path} y, {name} view against its contiguous copy", got, want)
         for path in BWD_PATHS:
+            got = softmax_triton_bwd(dy, x, path=path)
             want = softmax_triton_bwd(dy.contiguous(), x.contiguous(), path=path)
-            assert torch.equal(softmax_triton_bwd(dy, x, path=path), want), f"{path}: dx for the {name} view differs"
+            assert_same_bits(f"{path} dx, {name} view against its contiguous copy", got, want)
 
 
 # ---------------------------------------------------------------------------

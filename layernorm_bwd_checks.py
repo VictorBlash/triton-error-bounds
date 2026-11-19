@@ -36,6 +36,7 @@ from common import (
     MutantCase,
     add_err,
     assert_close,
+    assert_same_bits,
     assert_within_bound,
     bound_rejects_mutant,
     compile_fresh,
@@ -314,11 +315,13 @@ def check_bound_rejects_mutants(device: str) -> dict[str, bool]:
 
 
 def check_strided_inputs(device: str) -> None:
-    """Layout test: strided x, dy and weight must give the same gradients as contiguous copies, on every path.
+    """Layout test: strided inputs must give the same gradients as contiguous copies, on every path.
 
     Every other case is contiguous. check_strided_inputs in layernorm_triton.py says what a
-    wrong stride or a missing copy would do. dw and db add a reduction over the rows, with
-    stride arithmetic of its own.
+    wrong stride or a missing copy would do. Here x, dy, weight, mean and rstd are all
+    strided. The shape is chosen so the loops that do stride arithmetic take more than one
+    step: several rows per program in the fused and dw/db kernels, several column tiles in
+    the dw/db kernel.
 
     Args:
         device: device to run on.
@@ -326,20 +329,23 @@ def check_strided_inputs(device: str) -> None:
     Raises:
         AssertionError: a gradient from the views differs from the contiguous copies'.
     """
-    m, n = 6, 1000
+    m, n = 300, 5000
     base, w2, b2 = make_inputs((2 * m, 2 * n), torch.float16, device)
     w_view = w2[::2]
     w, b = w_view.contiguous(), b2[::2].contiguous()
+    # dy comes from a wider tensor than x, so the two "every other row" views have different
+    # row strides and a launcher that passed one in place of the other is caught.
     g = torch.Generator(device=device).manual_seed(7)
-    dy_base = torch.randn(base.shape, generator=g, device=device).to(base.dtype)
-    for (name, x), dy in zip(strided_views(base).items(), strided_views(dy_base).values(), strict=True):
+    dy_base = torch.randn((2 * m, 3 * n), generator=g, device=device).to(base.dtype)
+    for (name, x), dy in zip(strided_views(base, m, n).items(), strided_views(dy_base, m, n).values(), strict=True):
         _, mean, rstd = layer_norm_triton_fwd(x.contiguous(), w, b)
+        # The same statistics as every other element of a longer tensor.
+        mean_view, rstd_view = (torch.repeat_interleave(t, 2)[::2] for t in (mean, rstd))
         for path in PATHS:
-            got = layer_norm_triton_bwd(dy, x, w_view, mean, rstd, path=path)
+            got = layer_norm_triton_bwd(dy, x, w_view, mean_view, rstd_view, path=path)
             want = layer_norm_triton_bwd(dy.contiguous(), x.contiguous(), w, mean, rstd, path=path)
-            assert all(torch.equal(a, e) for a, e in zip(got, want, strict=True)), (
-                f"{path}: gradients for the {name} view differ from its contiguous copy's"
-            )
+            for grad, a, e in zip(("dx", "dw", "db"), got, want, strict=True):
+                assert_same_bits(f"{path} {grad}, {name} view against its contiguous copy", a, e)
 
 
 # ---------------------------------------------------------------------------

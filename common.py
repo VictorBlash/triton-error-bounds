@@ -257,22 +257,44 @@ def assert_within_bound(name: str, got: torch.Tensor, ref: torch.Tensor, bound: 
     return bound_ratio(got, ref, bound)
 
 
-def strided_views(base: torch.Tensor) -> dict[str, torch.Tensor]:
-    """Two non-contiguous (M, N) views of a (2M, 2N) tensor, one for each way a launcher treats strides.
+def strided_views(base: torch.Tensor, m: int, n: int) -> dict[str, torch.Tensor]:
+    """Two non-contiguous (M, N) views of a larger tensor, one for each way a launcher treats strides.
 
     "every other row" is unit-stride along each row, so a launcher copies nothing and
-    passes the row stride to the kernel. "every other column" is not, so a launcher has
-    to copy it before the kernel can index it. Either way the elements between the
-    view's own are valid memory holding plausible numbers: reading them raises nothing.
+    passes the row stride to the kernel. That stride is twice the width of `base`, so
+    bases of different widths give views with different row strides, which is how a check
+    tells a launcher that mixed two of them up. "every other column" is not unit-stride,
+    so a launcher has to copy it before the kernel can index it. Either way the elements
+    between the view's own are valid memory holding plausible numbers: reading them
+    raises nothing.
+
+    Args:
+        base: 2-D tensor with at least 2M rows and 2N columns.
+        m: rows in each view.
+        n: columns in each view.
 
     Raises:
         AssertionError: a view is contiguous or the wrong shape, so it would test nothing.
     """
-    m, n = base.shape[0] // 2, base.shape[1] // 2
-    views = {"every other row": base[::2, :n], "every other column": base[:m, ::2]}
+    views = {"every other row": base[: 2 * m : 2, :n], "every other column": base[:m, : 2 * n : 2]}
     for name, view in views.items():
         assert view.shape == (m, n) and not view.is_contiguous(), f"{name}: not a strided (M, N) view"
     return views
+
+
+def assert_same_bits(name: str, got: torch.Tensor, want: torch.Tensor) -> None:
+    """Assert two results are bit-identical. The message says how many elements differ and by how much.
+
+    The size is what tells two failures apart: a launcher that read the wrong memory is off
+    by about the size of the data, a kernel that rounded differently by one unit in the
+    last place.
+    """
+    assert got.shape == want.shape, f"{name}: shapes differ, {tuple(got.shape)} and {tuple(want.shape)}"
+    diff = torch.nan_to_num((got.double() - want.double()).abs(), nan=float("inf"))
+    assert torch.equal(got, want), (
+        f"{name}: {int((got != want).sum())} of {got.numel()} elements differ, "
+        f"largest |difference| {diff.max().item():.3e}"
+    )
 
 
 class MutantCase(NamedTuple):
