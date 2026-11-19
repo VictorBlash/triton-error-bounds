@@ -50,15 +50,16 @@ LayerNorm kernels are a Triton tutorial. The verification is the point of this r
 | `probe_tolerances.py` | Fixed tolerances against the per-element bound: which accept every correct output and reject every planted fault |
 | `emulation.py` | fp32 torch stand-ins for every kernel launch, so the probe and the mutation tests can be rehearsed on a CPU |
 | `softmax_cpu_check.py` | The softmax error bound against an fp32 emulation of the kernels; runs without a GPU or Triton |
+| `layout_cpu_check.py` | The strided-input and non-finite-input checks against the stand-ins and against deliberately broken launchers; runs without a GPU or Triton |
 | `train_check.py` | Training-loop check: a small transformer trained through both autograd wrappers, against PyTorch's operations, with mutation tests |
 | `kaggle_run.py` | Runs the checks or benchmarks on a Kaggle T4 from the command line and returns the result |
-| `requirements.txt` | The torch and triton versions every check last passed on |
-| `.github/workflows/ci.yml` | Runs the linter and the three CPU scripts on every push. No GPU, so no kernel runs there |
+| `requirements.txt` | The torch and triton versions of the last GPU run |
+| `.github/workflows/ci.yml` | Runs the linter and the four CPU scripts on every push. No GPU, so no kernel runs there |
 | `RESULTS.md` | Measurements and decisions |
 
 ## Running
 
-Needs a CUDA GPU with PyTorch and Triton, on Linux. `requirements.txt` pins the versions every check last passed on: torch 2.11.0 and triton 3.6.0, the ones on the free Kaggle T4 that produced the softmax results. The LayerNorm results were produced on a free Colab T4 with torch 2.14.1 and triton 3.8.0. Upload every `.py` file: all the scripts import `common.py`.
+Needs a CUDA GPU with PyTorch and Triton, on Linux. `requirements.txt` pins the versions of the last GPU run: torch 2.11.0 and triton 3.6.0, the ones on the free Kaggle T4 that produced the softmax results. The LayerNorm results were produced on a free Colab T4 with torch 2.14.1 and triton 3.8.0. Upload every `.py` file: all the scripts import `common.py`.
 
 ```
 python layernorm_triton.py --skip-bench       # forward checks, about a minute
@@ -73,6 +74,7 @@ python probe_attention.py                     # is a fused attention kernel wort
 python probe_tolerances.py                    # which fixed tolerances do the job of the per-element bound?
 python probe_tolerances.py --emulate          # the same script on the CPU, without Triton: tests the script
 python softmax_cpu_check.py                   # error-model check, no GPU needed
+python layout_cpu_check.py                    # can the layout and non-finite checks fail? no GPU needed
 python train_check.py                         # train a small model through both autograd wrappers
 python train_check.py --emulate               # the same script on the CPU, without Triton: tests the script
 ```
@@ -88,7 +90,7 @@ It packs every module into one private Kaggle script, so a file cannot be left o
 
 Every check prints an `ok` line; a failure raises with the check name and, for the bound, the worst element. The benchmarks include eager PyTorch and `torch.compile` columns; `--no-compile` leaves the compiled one out.
 
-Every push also runs `ruff check` and the three CPU scripts (`softmax_cpu_check.py`, `probe_tolerances.py --emulate`, `train_check.py --emulate`) on GitHub Actions. The hosted runners have no GPU and the emulation replaces every kernel launch, so the badge at the top says the error model and the scripts hold together. It says nothing about the kernels; only a GPU run does.
+Every push also runs `ruff check` and the four CPU scripts (`softmax_cpu_check.py`, `probe_tolerances.py --emulate`, `train_check.py --emulate`, `layout_cpu_check.py`) on GitHub Actions. The hosted runners have no GPU and the emulation replaces every kernel launch, so the badge at the top says the error model and the scripts hold together. It says nothing about the kernels; only a GPU run does.
 
 Use in a model:
 
@@ -99,8 +101,8 @@ y = layer_norm_autograd(x, weight, bias)   # x: fp16 or bf16 CUDA tensor of shap
 
 ## Limits
 
-- Every number and every passed check is from a Tesla T4, compute capability 7.5. Triton's README lists NVIDIA GPUs of compute capability 8.0 or higher as supported hardware, so the T4 is below Triton's stated support. Nothing here has run on a supported GPU.
-- The strided-input checks and the non-finite-input check for the LayerNorm forward were added after the last GPU run. On a CPU they have only been rehearsed against stand-ins for the launchers they test, so they are unproven until the next GPU run.
+- Every number and every passed check is from a Tesla T4, compute capability 7.5. [Triton's README](https://github.com/triton-lang/triton/blob/main/README.md) lists NVIDIA GPUs of compute capability 8.0 or higher as supported hardware, so the T4 is below Triton's stated support. Nothing here has run on a supported GPU.
+- The strided-input checks and the non-finite-input check for the LayerNorm forward were added after the last GPU run, and so was the one launcher change they led to: the LayerNorm backward now copies a strided `mean` or `rstd` before its kernels index them. On a CPU, `layout_cpu_check.py` shows that the checks run and that they reject broken launchers. It cannot test the real ones, so all of this is unproven until the next GPU run.
 - fp16 and bf16 inputs only, with fp32 statistics. No fp32 input path.
 - LayerNorm rows must fit one block: N ≤ 32768 for fp16 and bf16. Softmax has no such limit, but above it uses the slower two-pass paths.
 - Tuning constants (the layout switch at N = 16384, the 8-warp cap on the dx kernel, the softmax block limit and tile width) are T4 measurements. Rerun the probe and benchmarks before trusting them on another GPU.
