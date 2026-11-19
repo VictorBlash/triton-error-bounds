@@ -47,6 +47,7 @@ from common import (
     print_median_table,
     require_cuda,
     store_err,
+    strided_views,
     time_fn,
 )
 from layernorm_triton import (
@@ -312,6 +313,35 @@ def check_bound_rejects_mutants(device: str) -> dict[str, bool]:
     return {case.label: bound_rejects_mutant(case) for case in mutant_cases(device)}
 
 
+def check_strided_inputs(device: str) -> None:
+    """Layout test: strided x, dy and weight must give the same gradients as contiguous copies, on every path.
+
+    Every other case is contiguous. check_strided_inputs in layernorm_triton.py says what a
+    wrong stride or a missing copy would do. dw and db add a reduction over the rows, with
+    stride arithmetic of its own.
+
+    Args:
+        device: device to run on.
+
+    Raises:
+        AssertionError: a gradient from the views differs from the contiguous copies'.
+    """
+    m, n = 6, 1000
+    base, w2, b2 = make_inputs((2 * m, 2 * n), torch.float16, device)
+    w_view = w2[::2]
+    w, b = w_view.contiguous(), b2[::2].contiguous()
+    g = torch.Generator(device=device).manual_seed(7)
+    dy_base = torch.randn(base.shape, generator=g, device=device).to(base.dtype)
+    for (name, x), dy in zip(strided_views(base).items(), strided_views(dy_base).values(), strict=True):
+        _, mean, rstd = layer_norm_triton_fwd(x.contiguous(), w, b)
+        for path in PATHS:
+            got = layer_norm_triton_bwd(dy, x, w_view, mean, rstd, path=path)
+            want = layer_norm_triton_bwd(dy.contiguous(), x.contiguous(), w, mean, rstd, path=path)
+            assert all(torch.equal(a, e) for a, e in zip(got, want, strict=True)), (
+                f"{path}: gradients for the {name} view differ from its contiguous copy's"
+            )
+
+
 # ---------------------------------------------------------------------------
 # Benchmark
 # ---------------------------------------------------------------------------
@@ -383,6 +413,9 @@ def main() -> int:
     for shape, dtype, offset, why in CASES:
         check_backward(*make_inputs(shape, dtype, device, offset))
         print(f"ok  {str(dtype):15} {str(shape):14} {why} ({', '.join(PATHS)})")
+
+    check_strided_inputs(device)
+    print(f"ok  layout: strided views give the same gradients as their contiguous copies ({', '.join(PATHS)})")
 
     for label, also in check_bound_rejects_mutants(device).items():
         print(

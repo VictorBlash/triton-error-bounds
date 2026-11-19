@@ -50,6 +50,7 @@ from common import (
     print_median_table,
     require_cuda,
     store_err,
+    strided_views,
     time_fn,
 )
 
@@ -400,6 +401,54 @@ CASES: list[tuple[tuple[int, ...], torch.dtype, float, str]] = [
 ]
 
 
+def check_strided_inputs(device: str) -> None:
+    """Layout test: a strided view must give the same bits as a contiguous copy of it.
+
+    Every other case is contiguous, so nothing else exercises the row stride the launcher
+    passes to the kernel, or the copy it makes when a row is not unit-stride. Getting
+    either wrong reads the view's neighbours in the larger tensor: no error, plausible
+    numbers. weight and bias are strided here too, for the launcher's copy of those.
+
+    Args:
+        device: device to run on.
+
+    Raises:
+        AssertionError: a view's output differs from its contiguous copy's.
+    """
+    m, n = 6, 1000
+    base, w2, b2 = make_inputs((2 * m, 2 * n), torch.float16, device)
+    w, b = w2[::2], b2[::2]
+    for name, x in strided_views(base).items():
+        want = layer_norm_triton(x.contiguous(), w.contiguous(), b.contiguous())
+        assert torch.equal(layer_norm_triton(x, w, b), want), f"{name}: output differs from the contiguous copy's"
+
+
+def check_non_finite_rows(device: str) -> None:
+    """A NaN or an infinity in a row must turn that whole row into NaN, and change no other row.
+
+    The mean of such a row is not a number, so none of its outputs means anything. A
+    kernel that returned finite values there would hide corrupt activations from the code
+    that looks for them. Rows are independent, so the clean rows must come out bit for bit
+    as they do without the bad values.
+
+    Args:
+        device: device to run on.
+
+    Raises:
+        AssertionError: a bad row has an output that is not NaN, or a clean row changed.
+    """
+    x, w, b = make_inputs((8, 1000), torch.float16, device)
+    bad = {1: float("nan"), 4: float("inf"), 6: float("-inf")}
+    poisoned = x.clone()
+    for row, value in bad.items():
+        poisoned[row, 3 * row] = value
+    y = layer_norm_triton(poisoned, w, b)
+    for row, value in bad.items():
+        assert torch.isnan(y[row]).all(), f"the row holding {value} has outputs that are not NaN"
+    clean = [row for row in range(x.shape[0]) if row not in bad]
+    assert torch.equal(y[clean], layer_norm_triton(x, w, b)[clean]), "a bad value in one row changed another row"
+
+
 # ---------------------------------------------------------------------------
 # 5. Benchmark
 # ---------------------------------------------------------------------------
@@ -443,6 +492,11 @@ def main() -> int:
     for shape, dtype, offset, why in CASES:
         check_kernel(*make_inputs(shape, dtype, device, offset))
         print(f"ok  {str(dtype):15} {str(shape):14} {why}")
+
+    check_strided_inputs(device)
+    print("ok  layout: strided views give the same bits as their contiguous copies")
+    check_non_finite_rows(device)
+    print("ok  non-finite input: a NaN or an infinity makes its own row NaN and changes no other")
 
     allclose_caught = check_oracle_rejects_dropped_bias(device)
     print(

@@ -257,6 +257,24 @@ def assert_within_bound(name: str, got: torch.Tensor, ref: torch.Tensor, bound: 
     return bound_ratio(got, ref, bound)
 
 
+def strided_views(base: torch.Tensor) -> dict[str, torch.Tensor]:
+    """Two non-contiguous (M, N) views of a (2M, 2N) tensor, one for each way a launcher treats strides.
+
+    "every other row" is unit-stride along each row, so a launcher copies nothing and
+    passes the row stride to the kernel. "every other column" is not, so a launcher has
+    to copy it before the kernel can index it. Either way the elements between the
+    view's own are valid memory holding plausible numbers: reading them raises nothing.
+
+    Raises:
+        AssertionError: a view is contiguous or the wrong shape, so it would test nothing.
+    """
+    m, n = base.shape[0] // 2, base.shape[1] // 2
+    views = {"every other row": base[::2, :n], "every other column": base[:m, ::2]}
+    for name, view in views.items():
+        assert view.shape == (m, n) and not view.is_contiguous(), f"{name}: not a strided (M, N) view"
+    return views
+
+
 class MutantCase(NamedTuple):
     """One planted fault, with everything needed to judge it.
 

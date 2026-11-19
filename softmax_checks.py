@@ -53,6 +53,7 @@ from common import (
     print_median_table,
     require_cuda,
     store_err,
+    strided_views,
     sum_err,
     time_fn,
 )
@@ -446,6 +447,33 @@ def check_bound_rejects_mutants(device: str) -> dict[str, bool]:
     return {case.label: bound_rejects_mutant(case) for case in mutant_cases(device)}
 
 
+def check_strided_inputs(device: str) -> None:
+    """Layout test: strided inputs must give the same bits as contiguous copies, on every path.
+
+    Every other case is contiguous, so nothing else exercises the row strides the
+    launchers pass to the kernels, or the copy they make when a row is not unit-stride.
+    Getting either wrong reads the view's neighbours in the larger tensor: no error,
+    plausible numbers. The backward is compared view against copy, so its y does not have
+    to be a softmax output.
+
+    Args:
+        device: device to run on.
+
+    Raises:
+        AssertionError: an output from the views differs from the contiguous copies'.
+    """
+    m, n = 6, 1000  # 1000 fits one block, so both paths of each direction run
+    xs = strided_views(make_inputs((2 * m, 2 * n), torch.float16, device))
+    dys = strided_views(make_inputs((2 * m, 2 * n), torch.float16, device, seed=7))
+    for (name, x), dy in zip(xs.items(), dys.values(), strict=True):
+        for path in FWD_PATHS:
+            want = softmax_triton(x.contiguous(), path=path)
+            assert torch.equal(softmax_triton(x, path=path), want), f"{path}: y for the {name} view differs"
+        for path in BWD_PATHS:
+            want = softmax_triton_bwd(dy.contiguous(), x.contiguous(), path=path)
+            assert torch.equal(softmax_triton_bwd(dy, x, path=path), want), f"{path}: dx for the {name} view differs"
+
+
 # ---------------------------------------------------------------------------
 # Benchmark
 # ---------------------------------------------------------------------------
@@ -545,6 +573,9 @@ def main() -> int:
         ran = ", ".join(sorted(set(ys) | set(dxs)))
         print(f"ok  {str(dtype):15} {str(shape):14} {why} ({ran})")
         print(f"      largest |error| / bound   y: {_format_ratios(y_ratios)}   dx: {_format_ratios(dx_ratios)}")
+
+    check_strided_inputs(device)
+    print("ok  layout: strided views give the same bits as their contiguous copies (every path)")
 
     for label, also in check_bound_rejects_mutants(device).items():
         print(
