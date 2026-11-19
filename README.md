@@ -1,8 +1,8 @@
-# Triton LayerNorm
+# Triton error bounds
 
-Fused LayerNorm forward and backward in [Triton](https://github.com/triton-lang/triton), with a correctness check that is stricter than `torch.allclose` and every performance claim measured and recorded.
+LayerNorm and softmax kernels, forward and backward, in [Triton](https://github.com/triton-lang/triton), with a correctness check that is stricter than `torch.allclose` and every performance claim measured and recorded.
 
-Measured on a Tesla T4 (Google Colab), M = 4096 rows, fp16, against eager `F.layer_norm` and `torch.compile`:
+LayerNorm, measured on a Tesla T4 (Google Colab), M = 4096 rows, fp16, against eager `F.layer_norm` and `torch.compile`:
 
 | | vs eager PyTorch | vs torch.compile | Bandwidth |
 |:---|:---|:---|:---|
