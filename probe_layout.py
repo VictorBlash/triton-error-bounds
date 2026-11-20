@@ -1,24 +1,27 @@
 #!/usr/bin/env python3
-"""Do a kernel's output bits depend on the row stride of its input, and what does removing that cost?
+"""Do a kernel's output bits depend on the row stride of its input, and what would removing that cost?
 
 softmax_checks.py found the softmax block forward giving 2 of 30000 elements one fp16 unit
 in the last place apart between a view of every other row (row stride 20000) and its
-contiguous copy (row stride 5000). The first run of this probe showed why: Triton compiles a
-separate variant of a kernel when an integer argument is divisible by 16, with a different
-thread layout, and all four softmax kernels gave different bits in the two variants
-(RESULTS.md, "Strided and non-finite inputs"). The softmax kernels now leave their stride
-arguments out of that specialization. This probe measures both states.
+contiguous copy (row stride 5000). This probe showed why: Triton compiles a separate
+variant of a kernel when an integer argument is divisible by 16, with a different thread
+layout, and all four softmax kernels give different bits in the two variants. Leaving the
+stride arguments out of that specialization removes the dependence. It was measured up to
+1.7 times slower, so the kernels keep Triton's default (RESULTS.md, "Strided and
+non-finite inputs"). This probe measures both states.
 
 1. With the kernels as they are, it holds the same rows at six row strides, three
-   divisible by 16 and three not, and groups the strides by the bits of the output. One
-   group means the output does not depend on the stride.
-2. It does the same with each softmax kernel recompiled the way Triton compiles by
-   default, specializing on the strides: the state the failure was found in.
-3. It times each softmax kernel both ways on contiguous inputs, to price the change.
+   divisible by 16 and three not, and groups the strides by the bits of the output.
+   LayerNorm must give one group. Softmax may give one group or exactly the two
+   divisibility classes, because the layout check in softmax_checks.py relies on the
+   bits being the same within a class.
+2. It does the same with each softmax kernel recompiled with its stride arguments left
+   out of Triton's specialization.
+3. It times each softmax kernel both ways on contiguous inputs: the price of step 2.
 4. It prints, for every compiled variant of the block forward in Triton's cache, which
    arguments were marked divisible by 16 and which thread layouts Triton chose.
 
-The exit status is 1 if step 1 finds a kernel whose bits depend on the stride.
+The exit status is 1 if step 1 finds anything else.
 
 --emulate runs step 1 on the CPU with fp32 torch arithmetic in place of every kernel
 (emulation.py), where every stride must give the same bits. That tests this script, not
@@ -31,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import inspect
 import os
 import re
 import sys
@@ -52,6 +56,7 @@ STRIDES = (5000, 5008, 10000, 10004, 20000, 20008)  # the first is the contiguou
 BENCH_M = 4096  # the row count of every benchmark table in RESULTS.md
 BENCH_WIDTHS = (1024, 4096, 16384, 32768)
 SAME_BITS = "same bits at every stride"
+BY_16 = "SPLITS EXACTLY BY DIVISIBILITY BY 16"
 Outputs = tuple[torch.Tensor, ...]
 
 
@@ -87,8 +92,13 @@ def describe(groups: list[list[int]]) -> str:
         return SAME_BITS
     by_16 = [[s for s in STRIDES if s % 16 == 0], [s for s in STRIDES if s % 16 != 0]]
     if sorted(map(sorted, groups)) == sorted(by_16):
-        return "SPLITS EXACTLY BY DIVISIBILITY BY 16"
+        return BY_16
     return "SPLITS SOME OTHER WAY"
+
+
+def allowed(name: str, verdict: str) -> bool:
+    """Whether the checks allow for this grouping: one group, or for softmax the two divisibility classes."""
+    return verdict == SAME_BITS or (name.startswith("softmax") and verdict == BY_16)
 
 
 def report(name: str, run: Callable[[int], Outputs]) -> str:
@@ -111,12 +121,15 @@ def report(name: str, run: Callable[[int], Outputs]) -> str:
 
 
 @contextlib.contextmanager
-def default_specialization(module: object, name: str) -> Iterator[None]:
-    """Swap one kernel in `module` for the same source compiled the way Triton compiles by default."""
+def strides_unspecialized(module: object, name: str) -> Iterator[None]:
+    """Swap one kernel in `module` for the same source compiled with its row strides left out of specialization."""
     import triton
 
     current = getattr(module, name)
-    setattr(module, name, triton.jit(current.fn))
+    strides = [arg for arg in inspect.signature(current.fn).parameters if arg.endswith("_row_stride")]
+    assert strides, f"{name} has no row-stride arguments"
+    unspecialized = triton.jit(do_not_specialize=strides, do_not_specialize_on_alignment=strides)(current.fn)
+    setattr(module, name, unspecialized)
     try:
         yield
     finally:
@@ -193,20 +206,21 @@ def main() -> int:
             f"LayerNorm backward, {path}",
             lambda s, path=path: layer_norm_triton_bwd(held_at(dy, s), held_at(lx, s), w, mean, rstd, path=path),
         )
-    failures = sum(verdict != SAME_BITS for verdict in verdicts.values())
-
     if args.emulate:
+        # The stand-ins are torch arithmetic with no compiled variants, so here any split is a fault.
+        failures = sum(verdict != SAME_BITS for verdict in verdicts.values())
         print("\nsteps 2 to 4 need Triton: skipped under --emulate")
         print(f"\n{'OK' if failures == 0 else 'FAILED'}: {failures} failures")
         return 1 if failures else 0
+    failures = sum(not allowed(name, verdict) for name, verdict in verdicts.items())
 
-    print("\nstep 2: each softmax kernel recompiled with Triton's default specialization on its strides\n")
+    print("\nstep 2: each softmax kernel recompiled with its strides left out of Triton's specialization\n")
     for name, (kernel, run) in softmax_kernels.items():
-        with default_specialization(st, kernel):
+        with strides_unspecialized(st, kernel):
             report(name, lambda s, run=run: run(held_at(x, s), held_at(dy, s)))
 
-    print(f"\nstep 3: mean ms on contiguous inputs, {BENCH_M} rows. off = strides left out of specialization")
-    print("(the kernels as they are), on = Triton's default. off / on above 1 means the change costs time.\n")
+    print(f"\nstep 3: mean ms on contiguous inputs, {BENCH_M} rows. on = Triton's default specialization")
+    print("(the kernels as they are), off = strides left out of it. off / on above 1: leaving them out costs time.\n")
     print(f"{'kernel':<24} {'N':>6} {'off ms':>9} {'on ms':>9} {'off / on':>9} {'by median':>10}")
     worst = (0.0, "")
     for n in BENCH_WIDTHS:
@@ -215,9 +229,9 @@ def main() -> int:
         dyb = torch.randn_like(xb)
         for name, (kernel, run) in softmax_kernels.items():
             first = xb if "forward" in name else yb
-            off = time_fn(lambda: run(first, dyb))
-            with default_specialization(st, kernel):
-                on = time_fn(lambda: run(first, dyb))
+            on = time_fn(lambda: run(first, dyb))
+            with strides_unspecialized(st, kernel):
+                off = time_fn(lambda: run(first, dyb))
             ratio = off.mean / on.mean
             worst = max(worst, (ratio, f"{name} at N = {n}"))
             print(f"{name:<24} {n:>6} {off.mean:9.4f} {on.mean:9.4f} {ratio:9.3f} {off.median / on.median:10.3f}")
@@ -231,7 +245,10 @@ def main() -> int:
     print("\nsummary of step 1")
     for name, verdict in verdicts.items():
         print(f"  {name}: {verdict}")
-    print(f"\n{'OK' if failures == 0 else 'FAILED'}: {failures} kernels whose bits depend on the row stride")
+    print(
+        f"\n{'OK' if failures == 0 else 'FAILED'}: {failures} kernels whose bits depend on the row stride "
+        "in a way the checks do not allow for"
+    )
     return 1 if failures else 0
 
 

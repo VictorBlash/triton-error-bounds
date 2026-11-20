@@ -47,14 +47,13 @@ BLOCK_LIMIT = 32768
 # per vector, the same density the LayerNorm dx kernel runs at.
 TILE_N = 4096
 
-# Triton compiles a separate variant of a kernel when an integer argument is divisible by
-# 16, with a different thread layout, and these kernels then add a row's elements in a
-# different order. The same values in a tensor with another row stride came out one unit
-# in the last place apart (RESULTS.md, "Strided and non-finite inputs"). The stride
-# arguments are therefore left out of that specialization, so a row of a given width
-# always runs the same compilation.
-_FWD_STRIDES = ["x_row_stride", "y_row_stride"]
-_BWD_STRIDES = ["dy_row_stride", "y_row_stride", "dx_row_stride"]
+# The kernels below keep Triton's default specialization on their row-stride arguments.
+# Triton compiles a separate variant when a stride is divisible by 16, with a different
+# thread layout, and the two variants round a few elements differently: the same values
+# in a tensor with another row stride can come out one unit in the last place apart.
+# Passing do_not_specialize and do_not_specialize_on_alignment for the strides removes
+# that. It was measured up to 1.7 times slower (block backward, N = 32768), so it was not
+# kept. RESULTS.md, "Strided and non-finite inputs", has the numbers.
 
 
 # ---------------------------------------------------------------------------
@@ -62,7 +61,7 @@ _BWD_STRIDES = ["dy_row_stride", "y_row_stride", "dx_row_stride"]
 # ---------------------------------------------------------------------------
 
 
-@triton.jit(do_not_specialize=_FWD_STRIDES, do_not_specialize_on_alignment=_FWD_STRIDES)
+@triton.jit
 def _softmax_fwd_block_kernel(x_ptr, y_ptr, x_row_stride, y_row_stride, N, BLOCK_SIZE: tl.constexpr):
     row = tl.program_id(0).to(tl.int64)
     cols = tl.arange(0, BLOCK_SIZE)
@@ -77,7 +76,7 @@ def _softmax_fwd_block_kernel(x_ptr, y_ptr, x_row_stride, y_row_stride, N, BLOCK
     tl.store(y_ptr + row * y_row_stride + cols, y.to(y_ptr.dtype.element_ty), mask=mask)
 
 
-@triton.jit(do_not_specialize=_FWD_STRIDES, do_not_specialize_on_alignment=_FWD_STRIDES)
+@triton.jit
 def _softmax_fwd_online_kernel(x_ptr, y_ptr, x_row_stride, y_row_stride, N, BLOCK_N: tl.constexpr):
     row = tl.program_id(0).to(tl.int64)
     x_row = x_ptr + row * x_row_stride
@@ -116,7 +115,7 @@ def _softmax_fwd_online_kernel(x_ptr, y_ptr, x_row_stride, y_row_stride, N, BLOC
         tl.store(y_row + cols, y.to(y_ptr.dtype.element_ty), mask=mask)
 
 
-@triton.jit(do_not_specialize=_BWD_STRIDES, do_not_specialize_on_alignment=_BWD_STRIDES)
+@triton.jit
 def _softmax_bwd_block_kernel(
     dy_ptr, y_ptr, dx_ptr, dy_row_stride, y_row_stride, dx_row_stride, N, BLOCK_SIZE: tl.constexpr
 ):
@@ -131,7 +130,7 @@ def _softmax_bwd_block_kernel(
     tl.store(dx_ptr + row * dx_row_stride + cols, dx.to(dx_ptr.dtype.element_ty), mask=mask)
 
 
-@triton.jit(do_not_specialize=_BWD_STRIDES, do_not_specialize_on_alignment=_BWD_STRIDES)
+@triton.jit
 def _softmax_bwd_tiled_kernel(
     dy_ptr, y_ptr, dx_ptr, dy_row_stride, y_row_stride, dx_row_stride, N, BLOCK_N: tl.constexpr
 ):
@@ -283,7 +282,9 @@ def softmax_triton_bwd(dy: torch.Tensor, y: torch.Tensor, path: str | None = Non
         )
     else:
         tile = tile_for(n)
-        _softmax_bwd_tiled_kernel[(m,)](dy_rows, y_rows, dx, *strides, n, BLOCK_N=tile, num_warps=num_warps_for(tile))
+        _softmax_bwd_tiled_kernel[(m,)](
+            dy_rows, y_rows, dx, *strides, n, BLOCK_N=tile, num_warps=num_warps_for(tile)
+        )
     return dx.reshape(y.shape)
 
 
