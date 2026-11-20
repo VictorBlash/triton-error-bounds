@@ -448,34 +448,80 @@ def check_bound_rejects_mutants(device: str) -> dict[str, bool]:
     return {case.label: bound_rejects_mutant(case) for case in mutant_cases(device)}
 
 
+# (width, extra columns in the larger tensors, whether the "every other row" views' row
+# strides are divisible by 16 exactly when the width is). Both widths fit one block and
+# are two column tiles for the online and tiled kernels.
+LAYOUT_CASES: list[tuple[int, int, bool]] = [
+    (5000, 4, True),  # row strides 20008 and 30008: like the width, not divisible by 16
+    (4992, 0, True),  # row strides 19968 and 29952: like the width, divisible by 16
+    (5000, 0, False),  # row strides 20000 and 30000 are divisible by 16, the width is not
+    (4992, 4, False),  # row strides 19976 and 29960 are not divisible by 16, the width is
+]
+
+
+def _kernel_row_stride(t: torch.Tensor) -> int:
+    """The row stride a kernel is given for t: the launchers copy a tensor whose rows are not unit-stride."""
+    return t.stride(0) if t.stride(-1) == 1 else t.shape[-1]
+
+
 def check_strided_inputs(device: str) -> None:
-    """Layout test: strided inputs must give the same bits as contiguous copies, on every path.
+    """Layout test: strided inputs must stay inside the bound, and match contiguous copies bit for bit
+    wherever Triton compiles the two launches the same way.
 
     Every other case is contiguous, so nothing else exercises the row strides the
     launchers pass to the kernels, or the copy they make when a row is not unit-stride.
     Getting either wrong reads the view's neighbours in the larger tensor: no error,
-    plausible numbers. The backward is compared view against copy, so its y does not have
-    to be a softmax output.
+    plausible numbers.
+
+    Triton compiles a separate variant of a kernel when a row stride is divisible by 16,
+    and the softmax kernels round a few elements differently in the two variants
+    (RESULTS.md, "Strided and non-finite inputs"). So the same bits as the contiguous
+    copy are required only when every row stride the kernel is given falls in the same
+    divisibility class as the copy's, which is the width. The per-element bound against
+    fp64 is required of every view, including the ones that run a variant no contiguous
+    tensor of that width does.
 
     Args:
         device: device to run on.
 
     Raises:
-        AssertionError: an output from the views differs from the contiguous copies'.
+        AssertionError: a view's output is outside the bound, differs from its contiguous
+            copy's where it must not, or a case no longer has the layout it was written for.
     """
-    m, n = 6, 5000  # fits one block, and is two column tiles for the online and tiled kernels
-    xs = strided_views(make_inputs((2 * m, 2 * n), torch.float16, device), m, n)
-    # dy comes from a wider tensor than y, so the two "every other row" views have different
-    # row strides and a launcher that passed one in place of the other is caught.
-    dys = strided_views(make_inputs((2 * m, 3 * n), torch.float16, device, seed=7), m, n)
-    for (name, x), dy in zip(xs.items(), dys.values(), strict=True):
-        for path in FWD_PATHS:
-            got, want = softmax_triton(x, path=path), softmax_triton(x.contiguous(), path=path)
-            assert_same_bits(f"{path} y, {name} view against its contiguous copy", got, want)
-        for path in BWD_PATHS:
-            got = softmax_triton_bwd(dy, x, path=path)
-            want = softmax_triton_bwd(dy.contiguous(), x.contiguous(), path=path)
-            assert_same_bits(f"{path} dx, {name} view against its contiguous copy", got, want)
+    m = 6
+    for n, extra, same_class in LAYOUT_CASES:
+        x_base = make_inputs((2 * m, 2 * n + extra), torch.float16, device)
+        xs = strided_views(x_base, m, n)
+        # The backward's y: softmax outputs over the wider rows. They do not sum to 1 over a
+        # view's columns, which the backward does not need, and they have the size of real
+        # softmax outputs, which keeps its bound as tight as in the other cases.
+        ys = strided_views(softmax_eager(x_base), m, n)
+        # dy comes from a wider tensor than y, so the two "every other row" views have different
+        # row strides and a launcher that passed one in place of the other is caught.
+        dys = strided_views(make_inputs((2 * m, 3 * n + extra), torch.float16, device, seed=7), m, n)
+        for name in xs:
+            x, y, dy = xs[name], ys[name], dys[name]
+            xc, yc, dyc = x.contiguous(), y.contiguous(), dy.contiguous()
+            where = f"N = {n}, {name} view"
+            classes = {(_kernel_row_stride(t) % 16 == 0) == (n % 16 == 0) for t in (x, y, dy)}
+            assert len(classes) == 1, f"{where}: the three views are not in one divisibility class"
+            same_bits = classes.pop()
+            if name == "every other row":
+                assert same_bits == same_class, f"{where}: row strides are not in the class this case is for"
+            for path in FWD_PATHS:
+                got = softmax_triton(x, path=path)
+                y_ref, bound = softmax_reference_with_bound(xc, 0 if path == "block" else online_tiles(n))
+                assert_within_bound(f"{path} y, {where} vs fp64", got, y_ref, bound)
+                if same_bits:
+                    want = softmax_triton(xc, path=path)
+                    assert_same_bits(f"{path} y, {where} against its contiguous copy", got, want)
+            dx_ref, dx_bound = softmax_bwd_reference_with_bound(dyc, yc)
+            for path in BWD_PATHS:
+                got = softmax_triton_bwd(dy, y, path=path)
+                assert_within_bound(f"{path} dx, {where} vs fp64", got, dx_ref, dx_bound)
+                if same_bits:
+                    want = softmax_triton_bwd(dyc, yc, path=path)
+                    assert_same_bits(f"{path} dx, {where} against its contiguous copy", got, want)
 
 
 # ---------------------------------------------------------------------------
@@ -579,7 +625,10 @@ def main() -> int:
         print(f"      largest |error| / bound   y: {_format_ratios(y_ratios)}   dx: {_format_ratios(dx_ratios)}")
 
     check_strided_inputs(device)
-    print("ok  layout: strided views give the same bits as their contiguous copies (every path)")
+    print(
+        "ok  layout: strided views stay inside the bound, and give the same bits as their contiguous "
+        "copies where Triton compiles both launches the same way (every path)"
+    )
 
     for label, also in check_bound_rejects_mutants(device).items():
         print(
