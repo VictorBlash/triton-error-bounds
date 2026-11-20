@@ -1,7 +1,7 @@
 # The versions on the Kaggle Tesla T4 that every GPU run since 2026-11-16 used. The torch
-# build there is 2.11.0+cu130. Every check passed on them at commit 024a1bc; at 76138f0
-# one check added since fails (RESULTS.md, "Strided and non-finite inputs"). Linux only;
-# Triton does not support macOS or Windows.
+# build there is 2.11.0+cu130. Every check passed on them at commit 024a1bc. The softmax
+# layout check added since has not run on a GPU in its current form (RESULTS.md, "Strided
+# and non-finite inputs"). Linux only; Triton does not support macOS or Windows.
 #
 # The LayerNorm benchmark tables at the top of the README came from torch 2.14.1 with
 # triton 3.8.0. Timings differ between the two pairs: see Limits in README.md before

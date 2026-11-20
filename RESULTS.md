@@ -217,7 +217,7 @@ The tables are the second of two runs on this environment. The first, a day earl
 
 ### Correctness
 
-`softmax_checks.py` passes every check on the T4.
+`softmax_checks.py` passed every check it had at the time of these runs on the T4. The layout check added on 2026-11-19 is not among them; see "Strided and non-finite inputs".
 
 - 13 shapes, each on every path that fits: block and online forward, block and tiled backward. N = 40000 is above the single-block limit and runs on the online and tiled paths only. N = 1 passes on the online path, where the tile is one element wide.
 - Each forward output and each dx is checked for finite values, against eager with `allclose`, and against fp64 with the per-element bound. Two launches must be bitwise equal, and a row launched alone must equal the same row from the batch.
@@ -433,7 +433,7 @@ The mutation tests were restructured for this probe so that both judge the same 
 
 ## Strided and non-finite inputs
 
-Run on the Kaggle T4 on 2026-11-19: commit 76138f0, build 20261119T192009-d0afc3a1, torch 2.11.0+cu130, triton 3.6.0. The run's result is FAIL. One check failed.
+Run on the Kaggle T4 on 2026-11-19: commit 76138f0, build 20261119T192009-d0afc3a1, torch 2.11.0+cu130, triton 3.6.0. The run's result is FAIL. One check failed. Two more runs the same day, described below, measured the cause and timed a fix. The fix was not kept and the check was narrowed instead. The narrowed check has not run on a GPU.
 
 Until this run every check case was a contiguous tensor. `check_strided_inputs` feeds each launcher two non-contiguous views of a larger tensor and requires the same bits as contiguous copies: every other row, where the launcher passes the row stride to the kernel, and every other column, where the launcher has to copy. `check_non_finite_rows` puts a NaN, an infinity and a negative infinity into three rows of a LayerNorm forward input.
 
@@ -468,17 +468,40 @@ All four softmax kernels depend on whether the row stride is divisible by 16, an
 
 Why the bits change: Triton's cache holds the compiled variants of the block forward. The one with the input row stride marked divisible by 16 uses two thread layouts, 1 and 8 elements per thread. The ones without the mark use 1 element per thread only. That the different layout adds a row's elements in a different order, and so rounds the sum differently, is the reading that fits; the probe did not look at the order itself.
 
-**A fix that works for one kernel.** The block forward compiled with `do_not_specialize` and `do_not_specialize_on_alignment` for its two stride arguments gives the same bits at all six strides. That was not tried on the other three softmax kernels, and it was not timed. Every benchmark width in this file is divisible by 16, so every softmax timing here comes from the marked variant; the unmarked one has never been timed.
-
 **LayerNorm** gives the same bits at every stride, all 320000 elements, forward and both backward paths. Why it is not affected was not looked at: the probe printed the compiled variants of one softmax kernel only.
 
-**What the per-element bound has and has not covered.** For a contiguous tensor the row stride is the width, and the check cases have widths divisible by 16 (768, 1024, 4096, 8192, 20000, 40000) and not (7, 127, 1000, 5000). So softmax has passed the bound with the stride marked and with it unmarked. In those cases the width carries the same mark as the stride. The variant a strided view runs, stride marked and width not, has not been checked against the bound.
+**The fix, tried on all four kernels and timed.** Commit f50a1b0 (build 20261119T200930-ae620dc2, same GPU and versions) gave the four softmax kernels `do_not_specialize` and `do_not_specialize_on_alignment` for their row-stride arguments, so that a stride's divisibility no longer selects a variant. The run's result is PASS. With the change every softmax kernel gives the same bits at all six strides, and the layout check as first written passes on every path: both views, the same bits as the contiguous copies. The 13 softmax cases, both softmax mutation tests and the training-loop check pass too. In the same session each kernel recompiled with Triton's default split into the two divisibility classes again, so the change is what removed the dependence.
 
-**What follows whatever the cause.**
+The same run timed each kernel both ways, one straight after the other, on contiguous inputs with M = 4096 and fp16. Time with the strides left out of the specialization, divided by time with Triton's default:
 
-1. The determinism and batch-invariance checks compare launches that have the same row stride. For softmax they hold within one divisibility class of that stride and not across the two: the same values in a tensor laid out differently can come out one unit in the last place apart.
-2. Whether a strided view's output is inside the per-element bound was not measured. The layout check compares a view with its copy, not with the fp64 reference.
-3. `softmax_checks.py` still stops at this check, so `kaggle_run.py run` reports FAIL, and the softmax mutation tests and the rest of the softmax layout check do not run. Two ways out, not yet chosen: stop the softmax kernels specializing on their strides, once that has been timed, or keep the kernels and require the same bits only within a divisibility class.
+| N | Forward, block | Forward, online | Backward, block | Backward, tiled |
+|---:|---:|---:|---:|---:|
+| 1024 | 1.117 | 1.303 | 1.013 | 1.018 |
+| 4096 | 1.022 | 1.011 | 1.020 | 0.972 |
+| 16384 | 1.018 | 1.027 | 1.014 | 1.133 |
+| 32768 | 1.097 | 1.057 | 1.697 | 1.237 |
+
+These are ratios of means; the ratios of medians agree to 0.002. The largest is the block backward at N = 32768, 6.02 ms against 3.55 ms. It is one run with one timing per cell, but the cells at N = 16384 and 32768 do not stand alone. There the times with Triton's default match the Softmax tables above within 1% (3.53 ms in that table for the block backward at N = 32768), and the times without it match this run's own benchmark tables within 1%, which were measured with the change in place. In that benchmark the block backward at N = 32768 took 6.05 ms, behind `torch.compile` at 4.31 ms, where the kernel as it stands leads by 1.22x. The cells at N = 1024 are less firm: the block forward with Triton's default is 5% faster here than in the table above, and this run's benchmark timed the online forward without it at a mean of 0.0911 ms and a median of 0.0755 ms, so that kernel ran at two speeds.
+
+Why it is slower: Triton's cache from that run holds the block forward's variants from both compilations, and the listing does not say which compilation produced which. The marks do, because a kernel that leaves its strides out cannot carry a stride mark. Every variant without a stride mark uses 1 element per thread, including the one with the width marked, which is what the changed kernel runs at every benchmark width. Every variant with a stride mark uses 8 elements per thread, alone or beside 1. So Triton seems to need a stride's divisibility before it chooses the wider layout. That is the reading that fits; the generated code was not compared, and only the block forward's variants were listed.
+
+**Decision.** The rule was written into commit f50a1b0 before the run: keep the change only if no kernel is more than 3% slower than with the default at any width timed. Seven of the sixteen cells are, by up to 70%. The change was reverted. The kernels in `softmax_triton.py` are the ones every softmax table in this file was measured on; they have not changed since commit 024a1bc.
+
+**The check, narrowed.** `check_strided_inputs` in `softmax_checks.py` now runs four layouts: a width that is divisible by 16 (4992) or not (5000), with "every other row" views whose row strides are divisible by 16 or not. On every path:
+
+- Every view's output must be inside the per-element bound against fp64. That covers the two layouts where a view runs a variant that no contiguous tensor of its width runs: strides marked and width not, and the reverse.
+- The same bits as the contiguous copy are required wherever every row stride the kernel is given falls in the same divisibility class as the copy's, which is the width. That is two of the four "every other row" layouts, and all four "every other column" layouts, where the launcher copies.
+
+The LayerNorm layout checks are unchanged and still require the same bits across the classes.
+
+**What has and has not run on the GPU.**
+
+1. The same bits within a divisibility class, with the kernels as they now are: measured twice at width 5000, at commits 4599a99 and f50a1b0, for all four kernels and both classes of stride. At a width divisible by 16 it has not been measured on strided inputs.
+2. The narrowed check itself has run only on a CPU, against the stand-ins and the broken launchers in `layout_cpu_check.py`. That tests the check, not the kernels.
+3. Whether a view that runs one of the two mixed variants stays inside the per-element bound has not been measured. On contiguous inputs softmax has passed the bound with everything marked (widths 768, 1024, 4096, 8192, 20000, 40000) and with nothing marked (7, 127, 1000, 5000). The narrowed check asserts the mixed ones; until it runs on the T4 that is an expectation.
+4. The softmax launchers hand the kernels the right strides and copy where they must, on every path: the first-written check passed at f50a1b0, and the launchers are the same code now.
+5. The softmax mutation tests ran at f50a1b0 against the changed kernels. Against the kernels as they now are they last ran at commit 024a1bc.
+6. The determinism and batch-invariance checks compare launches that have the same row stride. For softmax they hold within one divisibility class and not across the two: the same values in a tensor laid out differently can come out one unit in the last place apart. That is now a documented property of these kernels, not a fault to be fixed.
 
 ## Fused attention: measured, not built
 
@@ -505,7 +528,8 @@ Limits of the verdict: one head dimension, non-causal, six hand-picked settings 
 
 ## Open items
 
-- The softmax kernels' output bits depend on whether the input's row stride is divisible by 16, because Triton compiles a different variant for it ("Strided and non-finite inputs"). LayerNorm's do not. Compiling without specialization on the strides removes the dependence in the one kernel it was tried on; it has not been tried on the other three or timed, and no softmax timing in this file comes from the variant it would leave. Until a way out is chosen `softmax_checks.py` fails at its layout check, `kaggle_run.py run` reports FAIL, and three things have not run on a GPU: the softmax layout check beyond the block forward, the softmax mutation tests at this commit, and any measurement of a strided view's output against the per-element bound.
+- The softmax kernels' output bits depend on whether the input's row stride is divisible by 16, because Triton compiles a different variant for it ("Strided and non-finite inputs"). LayerNorm's do not. Compiling without specialization on the strides removes the dependence in all four kernels and costs up to 70% (block backward at N = 32768), so it was not kept. The softmax layout check was narrowed to match, and in that form it has run only on a CPU against stand-ins. Not yet run on a GPU: the narrowed check, and with it any measurement of a strided view's output against the per-element bound in the two mixed variants, and any comparison of a strided view with its contiguous copy at a width divisible by 16. Until that run, whether `kaggle_run.py run` passes at this commit is not known.
+- The timing that decided this is one run with one timing per cell. Why leaving the strides out costs so much at N = 32768 and almost nothing at N = 4096 was not investigated beyond the thread layouts in Triton's cache.
 - Every number and every passed check in this file is from a Tesla T4, compute capability 7.5. Triton's README lists NVIDIA GPUs of compute capability 8.0 or higher as supported hardware (read on 2026-11-19, on `main` and at the v3.6.0 tag), so the T4 is below Triton's stated support. Nothing has been run on a supported GPU.
 - At the magnitude the mutation tests use, the per-element bound shows no advantage over the defaults of `torch.testing.assert_close` against an fp64 reference: both accept every correct output and reject all six planted faults. The bound pulls ahead only when the same faults are planted on smaller values. That rests on six faults chosen by the author, one GPU and one seed. No fault that a well-chosen fixed tolerance misses at ordinary magnitudes has been shown here.
 - The LayerNorm forward bound allows any summation order for the row statistics, which leaves a floor of about 5e-5 for outputs near zero at N = 1024, 20 times fp16 rounding. It accepted a dropped bias of up to 9e-6. Modeling the kernel's actual reduction order would tighten it; that has not been done.
