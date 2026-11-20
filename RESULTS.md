@@ -431,6 +431,35 @@ Limits: six faults, chosen by the author, on inputs chosen to make them small; t
 
 The mutation tests were restructured for this probe so that both judge the same tensors (`MutantCase` in `common.py`). The forward test now also requires the correct kernel to pass the bound on its own input, which the other five already did; it does, at 0.83 of the bound. `probe_tolerances.py --emulate` runs the probe on a CPU with fp32 torch arithmetic in place of the kernels (`emulation.py`). It tests the script, not the kernels, and none of the numbers above come from it except the two CPU figures in finding 6.
 
+## Strided and non-finite inputs
+
+Run on the Kaggle T4 on 2026-11-19: commit 76138f0, build 20261119T192009-d0afc3a1, torch 2.11.0+cu130, triton 3.6.0. The run's result is FAIL. One check failed.
+
+Until this run every check case was a contiguous tensor. `check_strided_inputs` feeds each launcher two non-contiguous views of a larger tensor and requires the same bits as contiguous copies: every other row, where the launcher passes the row stride to the kernel, and every other column, where the launcher has to copy. `check_non_finite_rows` puts a NaN, an infinity and a negative infinity into three rows of a LayerNorm forward input.
+
+| Check | Result |
+|:---|:---|
+| LayerNorm forward, strided x, weight and bias, (6, 1000) | same bits |
+| LayerNorm forward, rows holding NaN, inf and -inf, (8, 1000) | those rows all NaN, the other rows unchanged |
+| LayerNorm backward, strided x, dy, weight, mean and rstd, (300, 5000), fused and split | same bits for dx, dw and db |
+| Softmax block forward, every other row, (6, 5000) | **fails**: 2 of 30000 elements differ, by at most 1.192e-07 |
+| Softmax online forward, both backward paths, every other column | not reached |
+| Softmax mutation tests | not reached in this run; they passed at commit 024a1bc |
+
+The LayerNorm backward row includes a launcher change made the same day: `layer_norm_triton_bwd` used to pass `mean` and `rstd` to kernels that index them as packed arrays without looking at their strides. It now copies a strided one, and the check passes with both strided.
+
+**What the failure is.** 1.192e-07 is 2^-23, one unit in the last place of an fp16 value between 1.2e-4 and 2.4e-4; the mean softmax output at N = 5000 is 2e-4. So two outputs of 30000 were rounded to neighbouring fp16 values. It is not a launcher reading the wrong memory: `layout_cpu_check.py` shows what that looks like, about 25000 of 30000 elements off by about 1e-2. The view and its copy hold the same values, so the fp32 arithmetic before the final rounding came out slightly different in the two launches.
+
+**What is known about the cause.** The two launches differ in the row stride of the input, 20000 for the view and 5000 for the copy. Triton 3.6.0 compiles a separate variant of a kernel when an integer argument is divisible by 16 (`python/triton/backends/compiler.py`, line 84), and 20000 is while 5000 is not. So the two launches ran two compilations of the same source. That is read from Triton's source. That the two compilations add or round in a different order is the hypothesis that fits, and it has not been tested. A run that compares a view and a copy whose strides are both divisible by 16, and a pair where neither is, would test it.
+
+**What the hypothesis does not explain.** The LayerNorm checks differ in the same way, strides of 4000, 20000 and 30000 against 1000 and 5000, and passed bit for bit, 1.5 million elements of dx among them.
+
+**What follows whatever the cause.**
+
+1. The determinism and batch-invariance checks compare launches that have the same row stride. They say nothing across memory layouts. For the softmax block forward a row's output can depend on how the tensor holding it is laid out, by one unit in the last place.
+2. Whether the view's output is inside the per-element bound was not measured. The layout check compares a view with its copy, not with the fp64 reference.
+3. `softmax_checks.py` stops at this check, so `kaggle_run.py run` reports FAIL, and the softmax mutation tests and the rest of the softmax layout check do not run. The check has been left as it is: loosening it before the cause is known would hide whatever the cause turns out to be.
+
 ## Fused attention: measured, not built
 
 Question: can a fused Triton attention forward beat PyTorch on this GPU? A fused kernel never writes the L x L score matrix to memory. But it has to do both matrix products itself, and Triton lowers `tl.dot` to plain fp32 multiply-adds below compute capability 8.0 (`lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp`: "Dot op using MMA for compute capability ... has been deprecated. It falls back to the FMA path"; the same text in 3.6.0 and 3.8.0). The T4 is 7.5. PyTorch's matmul uses the T4's tensor cores.
@@ -456,7 +485,7 @@ Limits of the verdict: one head dimension, non-causal, six hand-picked settings 
 
 ## Open items
 
-- Two checks added on 2026-11-19 have not run on a GPU. One feeds every launcher strided views (every other row, every other column, and for LayerNorm a strided weight, mean and rstd) and requires the same bits as contiguous copies; until then every case was contiguous, so the row strides passed to the kernels and the launchers' copies were untested. The other puts a NaN, an infinity and a negative infinity into three rows of a LayerNorm forward input and requires those rows to come out all NaN and the other rows unchanged. Writing the first one turned up a launcher gap: the LayerNorm backward passed `mean` and `rstd` to kernels that index them as packed arrays without checking their strides, so a strided one would have given wrong gradients with no error. It now copies them, and that change has not run on a GPU either. CPU emulation replaces the launchers these checks are aimed at, so `layout_cpu_check.py` can only show that the checks run against the stand-ins and reject fourteen deliberately broken launchers. The next `kaggle_run.py run` is the first real test.
+- The softmax block forward is not bit-identical between a view of every other row and its contiguous copy: 2 of 30000 elements differ by one fp16 unit in the last place ("Strided and non-finite inputs"). The cause is not established. The hypothesis, untested, is that Triton compiles a different kernel variant when the row stride is divisible by 16. Until it is settled `softmax_checks.py` fails at that check, `kaggle_run.py run` reports FAIL, and three things have not run on a GPU: the softmax layout check beyond the block forward, the softmax mutation tests at this commit, and any measurement of the view's output against the per-element bound.
 - Every number and every passed check in this file is from a Tesla T4, compute capability 7.5. Triton's README lists NVIDIA GPUs of compute capability 8.0 or higher as supported hardware (read on 2026-11-19, on `main` and at the v3.6.0 tag), so the T4 is below Triton's stated support. Nothing has been run on a supported GPU.
 - At the magnitude the mutation tests use, the per-element bound shows no advantage over the defaults of `torch.testing.assert_close` against an fp64 reference: both accept every correct output and reject all six planted faults. The bound pulls ahead only when the same faults are planted on smaller values. That rests on six faults chosen by the author, one GPU and one seed. No fault that a well-chosen fixed tolerance misses at ordinary magnitudes has been shown here.
 - The LayerNorm forward bound allows any summation order for the row statistics, which leaves a floor of about 5e-5 for outputs near zero at N = 1024, 20 times fp16 rounding. It accepted a dropped bias of up to 9e-6. Modeling the kernel's actual reduction order would tighten it; that has not been done.
